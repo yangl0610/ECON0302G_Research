@@ -229,27 +229,24 @@ class Civilization:
             "tech_nav":   [],
             "tech_mil":   [],
             "tech_ind":   [],
-            "tech_com":   [],
+            "tech_com":       [],
+            # 每回合决策快照
+            "decision_tech":   [],   # 重点技术领域
+            "decision_expand": [],   # 扩张等级 0/1/2
+            "decision_trade":  [],   # 贸易政策
         }
 
     # ─── 初始化辅助 ──────────────────────────────────
 
     def _init_population(self) -> float:
-        """
-        1000 AD 人口估算（百万人）。
-        基准值 6M，按地理条件和粮食资源缩放。
-        大致校准：中国 ~60M，西欧 ~30M，美洲 ~20M
-        """
+        """1000 AD 人口估算（百万人）。基准值 6M，按地理条件和粮食资源缩放。"""
         base = 6.0
         geo_factor  = 0.5 + 0.5 * self.geography.agri_potential()
         res_factor  = 0.5 + 0.5 * min(self.resources.food / 2.0, 1.0)
         return base * geo_factor * res_factor
 
     def _init_gdp(self) -> float:
-        """
-        GDP 初始值（相对单位）。
-        人均 GDP 约 0.10 单位（对应麦迪森数据库中 1000 AD 的历史估计）。
-        """
+        """GDP 初始值（相对单位），人均 GDP 约 0.10 单位。"""
         return self.population * 0.10
 
     # ─── 属性 ────────────────────────────────────────
@@ -260,8 +257,8 @@ class Civilization:
 
     # ─── 状态记录 ─────────────────────────────────────
 
-    def record(self, year: int, era: Era) -> None:
-        """将当前状态快照追加到历史记录，每回合调用一次。"""
+    def record(self, year: int, era: Era, decision: dict = None) -> None:
+        """将当前状态快照追加到历史记录，每回合调用一次。decision 为本回合策略决策。"""
         h = self.history
         t = self.technology
         h["year"].append(year)
@@ -280,6 +277,10 @@ class Civilization:
         h["tech_mil"].append(round(t.military, 2))
         h["tech_ind"].append(round(t.industry, 2))
         h["tech_com"].append(round(t.commerce, 2))
+        dec = decision or {}
+        h["decision_tech"].append(dec.get("tech_focus", "agriculture"))
+        h["decision_expand"].append(dec.get("expansion_level", 0))
+        h["decision_trade"].append(dec.get("trade_policy", "balanced"))
 
     # ─── 供 RL 智能体使用的状态向量 ────────────────────
 

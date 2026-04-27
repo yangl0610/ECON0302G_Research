@@ -1,630 +1,840 @@
 """
-app.py — Streamlit 可视化仪表板（Vega-Altair 版）
---------------------------------------------------
-运行方式：
-    streamlit run app.py
-
-所有图表均使用 Vega-Altair（通过 VegaLite 规范渲染），
-声明式语法将数据映射到视觉属性，无需手动管理坐标系。
-
-标签页：
-  🌍 世界概览    — GDP 份额面积图 + 经济规模散点图
-  📈 经济轨迹    — GDP / 人均 GDP / 人口 / 军事 4 面板折线图
-  🔬 技术竞赛    — 各技术领域折线图 + 技术结构雷达图
-  🚢 贸易与殖民  — 贸易收益 + 殖民收益 + 开放度
-  🔀 反事实分析  — 4 组历史假设实验对比
-  🤖 ML 策略分析 — Q-learning 训练曲线 + 策略涌现行为
+app.py — 文明竞争模拟仪表板
+运行方式：streamlit run app.py
 """
 
 import streamlit as st
 import altair as alt
-from vega_datasets import data as vega_data
 import pandas as pd
 import numpy as np
 import sys, os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from src.engine import SimulationEngine, build_default_civs
+from src.engine import SimulationEngine
 from src.strategies import make_strategy
-from src.geography import build_control_df
+import json
+from src.archetypes import (
+    build_competition_civs, COMPETITION_MODES,
+    archetype_descs, compute_trade_matrix, default_params,
+)
+from src.strategies import RULE_BASED_STRATEGIES
 
-# ── 页面配置 ──────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="世界经济形成模拟",
-    page_icon="🌍",
+    page_title="World Econ Sim",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────
-# 辅助：历史时期背景色带（Altair mark_rect 图层）
-# ─────────────────────────────────────────────
+# ── 颜色与标签常量 ────────────────────────────────────────────────────────
+TECH_LABELS = {
+    "agriculture": "🌾 农业",
+    "navigation":  "⛵ 航海",
+    "military":    "⚔️ 军事",
+    "industry":    "🏭 工业",
+    "commerce":    "💰 商业",
+}
+TECH_COLORS = {
+    "agriculture": "#2a9d8f",
+    "navigation":  "#457b9d",
+    "military":    "#e63946",
+    "industry":    "#9c6644",
+    "commerce":    "#e9c46a",
+}
+EXPAND_LABELS = {0: "保守", 1: "温和扩张", 2: "激进殖民"}
+TRADE_LABELS  = {"open": "开放", "balanced": "均衡", "closed": "封闭"}
+
 ERA_BAND_DF = pd.DataFrame([
-    {"era": "中世纪",    "start": 1000, "end": 1400, "color": "#8ecae6"},
-    {"era": "地理大发现","start": 1400, "end": 1600, "color": "#ffb703"},
-    {"era": "重商主义",  "start": 1600, "end": 1750, "color": "#fb8500"},
-    {"era": "工业革命",  "start": 1750, "end": 1860, "color": "#8338ec"},
+    {"era": "农业时代",  "start": 1000, "end": 1400, "color": "#8ecae6"},
+    {"era": "扩张时代",  "start": 1400, "end": 1600, "color": "#ffb703"},
+    {"era": "商业时代",  "start": 1600, "end": 1750, "color": "#fb8500"},
+    {"era": "工业时代",  "start": 1750, "end": 1860, "color": "#8338ec"},
 ])
 
+
 def era_bands() -> alt.Chart:
-    """
-    返回一个半透明的时代背景色带图层。
-    通过 Altair 的 layer() 叠加到主折线图上，
-    让读者一眼看出每条轨迹处于哪个历史时期。
-    """
     return (
         alt.Chart(ERA_BAND_DF)
         .mark_rect(opacity=0.08)
         .encode(
-            x=alt.X("start:Q", title="年份"),
-            x2="end:Q",
+            x=alt.X("start:Q"), x2="end:Q",
             color=alt.Color(
                 "era:N",
                 scale=alt.Scale(
-                    domain=["中世纪", "地理大发现", "重商主义", "工业革命"],
+                    domain=["农业时代", "扩张时代", "商业时代", "工业时代"],
                     range=["#8ecae6", "#ffb703", "#fb8500", "#8338ec"],
                 ),
-                legend=alt.Legend(title="历史时期"),
+                legend=alt.Legend(title="发展阶段", symbolOpacity=1),
             ),
+            tooltip=alt.value(None),
         )
     )
 
 
-def line_with_bands(
+def line_chart(
     df: pd.DataFrame,
-    y_field: str,
+    y: str,
     y_title: str,
-    color_field: str = "civilization:N",
-    color_map: dict = None,
+    color_map: dict,
     height: int = 300,
     title: str = "",
+    with_bands: bool = True,
 ) -> alt.LayerChart:
-    """
-    折线图 + 时代背景色带的通用构造器。
-
-    Altair 的 layer() 将多个图表叠加为同一坐标系：
-      layer[0] = 半透明色带（era_bands）
-      layer[1] = 折线（每个文明一条）
-
-    color_map: {文明名: 颜色代码} 字典，用于固定颜色
-    """
-    # 折线图主体
-    line_kwargs = dict(
-        x=alt.X("year:Q", title="年份"),
-        y=alt.Y(f"{y_field}:Q", title=y_title),
-        tooltip=["civilization:N", "year:Q", f"{y_field}:Q"],
-    )
-    if color_map:
-        civs  = list(color_map.keys())
-        hexes = list(color_map.values())
-        line_kwargs["color"] = alt.Color(
-            color_field,
-            scale=alt.Scale(domain=civs, range=hexes),
-            legend=alt.Legend(title="文明"),
-        )
-    else:
-        line_kwargs["color"] = alt.Color(color_field, legend=alt.Legend(title="文明"))
-
     lines = (
         alt.Chart(df)
-        .mark_line(strokeWidth=2.2, point=False)
-        .encode(**line_kwargs)
+        .mark_line(strokeWidth=2.3, point=alt.OverlayMarkDef(opacity=0, size=200))
+        .encode(
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y(f"{y}:Q", title=y_title),
+            color=alt.Color(
+                "civilization:N",
+                scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())),
+                legend=alt.Legend(title="Nation", symbolSize=160, labelFontSize=12,
+                                  symbolStrokeWidth=3, symbolOpacity=1),
+            ),
+            tooltip=["civilization:N", "year:Q", alt.Tooltip(f"{y}:Q", format=".3f")],
+        )
     )
-
-    return (
-        alt.layer(era_bands(), lines)
-        .properties(width="container", height=height, title=title)
-        .interactive()  # 允许缩放/拖拽
-    )
+    base = alt.layer(era_bands(), lines) if with_bands else lines
+    return base.properties(width="container", height=height, title=title).interactive()
 
 
-# ─────────────────────────────────────────────
-# 缓存：避免每次交互重跑模拟
-# ─────────────────────────────────────────────
-@st.cache_data(show_spinner="正在运行历史模拟...")
-def run_baseline(seed: int, events: bool, noise: float):
-    engine = SimulationEngine(events_enabled=events, noise_std=noise, seed=seed)
+# ── 缓存：运行模拟 ────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="正在运行模拟...")
+def run_simulation(mode_name: str, seed: int, events: bool, noise: float,
+                   overrides_json: str = "{}"):
+    overrides = json.loads(overrides_json)
+    civs = build_competition_civs(mode_name, overrides)
+    engine = SimulationEngine(civs=civs, events_enabled=events, noise_std=noise, seed=seed)
     engine.run()
     return engine.get_history_df(), engine.get_event_df()
 
 
-@st.cache_data(show_spinner="正在训练 RL 智能体并运行模拟...")
-def run_with_rl(seed: int, n_episodes: int):
-    civs = build_default_civs()
+@st.cache_data(show_spinner="正在训练 RL 智能体...")
+def run_with_rl(mode_name: str, seed: int, n_episodes: int, overrides_json: str = "{}"):
+    overrides = json.loads(overrides_json)
+    civs = build_competition_civs(mode_name, overrides)
+    rl_types = ["RL_gdp", "RL_power", "RL_trade"]
     strategy_map = {}
-    for civ in civs:
-        if civ.name == "西北欧（荷英）":
-            strategy_map[civ.name] = make_strategy("RL_gdp")
-        elif civ.name == "伊比利亚（葡西）":
-            strategy_map[civ.name] = make_strategy("RL_power")
-        elif civ.name == "奥斯曼帝国":
-            strategy_map[civ.name] = make_strategy("RL_trade")
-        else:
-            strategy_map[civ.name] = make_strategy(civ.strategy_name)
-
+    for i, civ in enumerate(civs):
+        strategy_map[civ.name] = (
+            make_strategy(rl_types[i]) if i < len(rl_types)
+            else make_strategy(civ.strategy_name)
+        )
     engine = SimulationEngine(
         civs=civs, strategy_map=strategy_map,
         events_enabled=True, seed=seed, training_mode=True,
     )
-    curves       = engine.train_rl_agents(n_episodes=n_episodes)
+    curves = engine.train_rl_agents(n_episodes=n_episodes)
     engine.run()
-    return engine.get_history_df(), curves, engine.get_strategy_summary()
+    return engine.get_history_df(), curves, engine.get_strategy_summary() if hasattr(engine, "get_strategy_summary") else {}
 
 
-@st.cache_data(show_spinner="正在运行反事实实验...")
-def run_counterfactuals(seed: int):
+@st.cache_data(show_spinner="正在对比所有竞争模式...")
+def run_all_modes(seed: int, events: bool, noise: float):
     results = {}
-
-    # 基准线
-    e0 = SimulationEngine(civs=build_default_civs(), events_enabled=False, seed=seed)
-    e0.run(); results["历史基准"] = e0.get_history_df()
-
-    # 反事实 1：中国高海岸
-    civs1 = build_default_civs()
-    for c in civs1:
-        if c.name == "中华帝国":
-            c.geography.coast_access = 0.90
-            c.geography.strategic_location = 0.70
-    e1 = SimulationEngine(civs=civs1, events_enabled=False, seed=seed)
-    e1.run(); results["中国高海岸（郑和路线）"] = e1.get_history_df()
-
-    # 反事实 2：中国工业先行策略
-    civs2 = build_default_civs()
-    sm2 = {}
-    for c in civs2:
-        sm2[c.name] = make_strategy("IndustrialPioneer" if c.name == "中华帝国" else c.strategy_name)
-    e2 = SimulationEngine(civs=civs2, strategy_map=sm2, events_enabled=False, seed=seed)
-    e2.run(); results["中国工业先行策略"] = e2.get_history_df()
-
-    # 反事实 3：西北欧无煤炭
-    civs3 = build_default_civs()
-    for c in civs3:
-        if c.name == "西北欧（荷英）":
-            c.resources.coal = 0.1
-    e3 = SimulationEngine(civs=civs3, events_enabled=False, seed=seed)
-    e3.run(); results["西北欧无煤炭资源"] = e3.get_history_df()
-
+    for mode_name in COMPETITION_MODES:
+        civs = build_competition_civs(mode_name)
+        engine = SimulationEngine(civs=civs, events_enabled=events, noise_std=noise, seed=seed)
+        engine.run()
+        results[mode_name] = engine.get_history_df()
     return results
 
 
-# ─────────────────────────────────────────────
-# 侧边栏
-# ─────────────────────────────────────────────
+# ── 侧边栏 ───────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🎮 模拟控制")
+    st.title("Sim Controls")
     st.markdown("---")
-    seed       = st.slider("随机种子", 1, 200, 42)
-    events_on  = st.checkbox("开启历史随机事件", value=True)
-    noise_lvl  = st.slider("历史偶然性强度（噪声）", 0.0, 0.08, 0.025, step=0.005)
+    mode_name = st.selectbox("Mode", list(COMPETITION_MODES.keys()))
     st.markdown("---")
-    rl_eps = st.slider("Q-learning 训练轮数", 20, 150, 60, step=10)
+    seed      = st.slider("Seed", 1, 200, 42)
+    events_on = st.checkbox("Random events", value=True)
+    noise_lvl = st.slider("Noise", 0.0, 0.08, 0.025, step=0.005)
     st.markdown("---")
-    ALL_CIVS = ["中华帝国","西欧诸国","伊比利亚（葡西）","西北欧（荷英）",
-                "奥斯曼帝国","印度次大陆","撒哈拉以南非洲","美洲文明"]
-    show_civs = st.multiselect(
-        "显示哪些文明",
-        ALL_CIVS,
-        default=["中华帝国","西欧诸国","伊比利亚（葡西）","西北欧（荷英）","奥斯曼帝国"],
-    )
+    rl_eps = st.slider("RL episodes", 20, 150, 60, step=10)
     st.markdown("---")
-    st.caption("📊 图表引擎：Vega-Altair")
-    st.caption("📚 经济模型：Cobb-Douglas + Q-Learning")
 
-# ─────────────────────────────────────────────
-# 加载数据
-# ─────────────────────────────────────────────
-st.title("🌍 世界经济形成过程模拟")
-st.markdown("""
-> **研究问题**：大航海时代的航线选择、工业革命时期的技术路线——
-> 这些关键节点的不同决策，如何塑造了今天的世界经济格局？
+    # ── 文明初始设置 ──────────────────────────────
+    STRATEGY_OPTIONS = list(RULE_BASED_STRATEGIES.keys())
+    GEO_PARAMS = {
+        "coast_access":       ("海岸条件",     0.0, 1.0, 0.05),
+        "terrain_quality":    ("耕地质量",     0.0, 1.0, 0.05),
+        "strategic_location": ("战略位置",     0.0, 1.0, 0.05),
+        "climate_score":      ("气候适宜度",   0.0, 1.0, 0.05),
+        "river_density":      ("内河密度",     0.0, 1.0, 0.05),
+    }
+    RES_PARAMS = {
+        "food":    ("粮食", 0.0, 4.0, 0.1),
+        "metal":   ("金属", 0.0, 3.0, 0.1),
+        "wood":    ("木材", 0.0, 3.0, 0.1),
+        "luxury":  ("奢侈品", 0.0, 3.0, 0.1),
+        "coal":    ("煤炭", 0.0, 3.0, 0.1),
+    }
 
-本模拟通过简化版"文明博弈"，结合 **Q-Learning 强化学习**，
-推演地理禀赋 × 策略选择 × 历史偶然性对世界经济分化的贡献。
-""")
+    defaults = default_params(mode_name)
+    overrides = {}
+
+    with st.expander("Setup", expanded=False):
+        for civ_name, params in defaults.items():
+            color = params["color"]
+            st.markdown(
+                f'<span style="color:{color};font-weight:bold;font-size:14px">'
+                f'▍ {civ_name}</span>',
+                unsafe_allow_html=True,
+            )
+            civ_ov = {"geo": {}, "res": {}}
+
+            # 策略选择
+            default_strat = params["strategy"]
+            chosen_strat = st.selectbox(
+                "策略", STRATEGY_OPTIONS,
+                index=STRATEGY_OPTIONS.index(default_strat) if default_strat in STRATEGY_OPTIONS else 0,
+                key=f"strat_{civ_name}",
+            )
+            if chosen_strat != default_strat:
+                civ_ov["strategy"] = chosen_strat
+
+            # 地理参数
+            with st.popover("🗺️ 地理参数"):
+                for key, (label, lo, hi, step) in GEO_PARAMS.items():
+                    val = st.slider(
+                        label, lo, hi,
+                        float(round(params["geo"][key], 2)),
+                        step=step, key=f"geo_{civ_name}_{key}",
+                    )
+                    if abs(val - params["geo"][key]) > 1e-6:
+                        civ_ov["geo"][key] = val
+
+            # 资源参数
+            with st.popover("⛏️ 资源参数"):
+                for key, (label, lo, hi, step) in RES_PARAMS.items():
+                    val = st.slider(
+                        label, lo, hi,
+                        float(round(params["res"][key], 1)),
+                        step=step, key=f"res_{civ_name}_{key}",
+                    )
+                    if abs(val - params["res"][key]) > 1e-6:
+                        civ_ov["res"][key] = val
+
+            if civ_ov["geo"] or civ_ov["res"] or "strategy" in civ_ov:
+                overrides[civ_name] = civ_ov
+
+        if overrides:
+            st.info(f"{len(overrides)} overridden")
+        if st.button("↺ Reset"):
+            for key in list(st.session_state.keys()):
+                if any(key.startswith(p) for p in ["geo_", "res_", "strat_"]):
+                    del st.session_state[key]
+            st.rerun()
+
+    st.caption("Vega-Altair | Cobb-Douglas")
+
+# ── 加载数据 ─────────────────────────────────────────────────────────────
+overrides_json = json.dumps(overrides, sort_keys=True) if overrides else "{}"
+df, event_df = run_simulation(mode_name, seed, events_on, noise_lvl, overrides_json)
+
+_color_rows = df.drop_duplicates("civilization")[["civilization", "color"]]
+COLOR_MAP    = dict(zip(_color_rows["civilization"], _color_rows["color"]))
+CIVS         = list(COLOR_MAP.keys())
+final_df     = df[df["year"] == df["year"].max()]
+
+st.title(f"World Economy Sim — {mode_name}  ({COMPETITION_MODES[mode_name]['desc']})")
 st.markdown("---")
 
-df, event_df = run_baseline(seed, events_on, noise_lvl)
+winner = final_df.nlargest(1, "gdp").iloc[0]
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Top GDP", winner["civilization"])
+c2.metric("GDP",     f"{winner['gdp']:.1f}")
+c3.metric("Nations", len(CIVS))
+c4.metric("Span",    "Era 1 → Era 4")
 
-# 颜色映射（固定，保证各图一致）
-_color_rows = df.drop_duplicates("civilization")[["civilization","color"]]
-COLOR_MAP   = dict(zip(_color_rows["civilization"], _color_rows["color"]))
+st.markdown("---")
 
-df_flt = df[df["civilization"].isin(show_civs)] if show_civs else df
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🌍 世界概览",
-    "📈 经济轨迹",
-    "🔬 技术竞赛",
-    "🚢 贸易与殖民",
-    "🔀 反事实分析",
-    "🤖 ML 策略分析",
+# ── 标签页 ───────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Overview",
+    "GDP",
+    "Trade & Territory",
+    "Relations",
+    "Tech",
+    "Mode Compare",
+    "ML",
 ])
 
 
-# ═════════════════════════════════════════════
-# Tab 1：世界概览
-# ═════════════════════════════════════════════
+# ══════════════════════════════════════════════
+# Tab 1：竞争总览
+# ══════════════════════════════════════════════
 with tab1:
-    st.header("🌍 世界经济格局演变概览")
-
-    # 指标摘要
-    final = df[df["year"] == df["year"].max()]
-    top   = final.nlargest(1, "gdp").iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("1850年经济最强", top["civilization"])
-    c2.metric("最高 GDP",       f"{top['gdp']:.1f}")
-    c3.metric("全球 GDP 总量",  f"{final['gdp'].sum():.1f}")
-    c4.metric("模拟跨度",       "1000 — 1850 年")
+    descs = archetype_descs()
+    civ_info = [{"Nation": n, "Strategy": descs.get(n.split("·")[0], "")} for n in CIVS]
+    st.dataframe(pd.DataFrame(civ_info), use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # ── 全球 GDP 份额堆叠面积图 ──────────────────────────────
-    # 用 Altair mark_area + stack="normalize" 展示各文明占全球份额
-    st.subheader("全球 GDP 份额演变（权力转移图）")
-    st.caption("纵轴为 100%；某色块面积越大，该文明在全球经济中的份额越高。"
-               "工业时代西北欧的份额急剧扩大，清晰呈现『大分流』。")
+    st.subheader("Power Index")
 
-    # 计算份额
-    df_share = df.copy()
-    df_share["share"] = df_share.groupby("year")["gdp"].transform(lambda x: x / x.sum())
-    df_share_flt = df_share[df_share["civilization"].isin(show_civs or ALL_CIVS)]
+    power_df = df.copy()
+    power_df["power_raw"] = power_df["gdp"] * power_df["military_str"] * np.sqrt(power_df["territories"])
+    power_df["power_idx"] = power_df.groupby("year")["power_raw"].transform(lambda x: x / x.max() * 100)
 
-    # Altair 堆叠面积图
+    power_chart = line_chart(power_df, "power_idx", "Power (max=100)", COLOR_MAP,
+                             height=340, title="Power Index")
+    st.altair_chart(power_chart, use_container_width=True)
+
+    # 颜色图例
+    swatches = "".join(
+        f'<span style="display:inline-flex;align-items:center;margin:3px 8px;">'
+        f'<span style="background:{c};width:16px;height:16px;border-radius:3px;'
+        f'display:inline-block;margin-right:5px;"></span><span style="font-size:13px">{n}</span></span>'
+        for n, c in COLOR_MAP.items()
+    )
+    st.markdown(f'<div style="display:flex;flex-wrap:wrap;padding:4px 0">{swatches}</div>',
+                unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    st.subheader("GDP Share")
+
+    share_df = df.copy()
+    share_df["share"] = share_df.groupby("year")["gdp"].transform(lambda x: x / x.sum())
     share_chart = (
-        alt.Chart(df_share_flt)
+        alt.Chart(share_df)
         .mark_area(opacity=0.85)
         .encode(
-            x=alt.X("year:Q", title="年份", scale=alt.Scale(domain=[1000, 1860])),
-            y=alt.Y("share:Q", stack="normalize", title="GDP 全球份额",
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y("share:Q", stack="normalize", title="GDP 份额",
                     axis=alt.Axis(format=".0%")),
             color=alt.Color(
                 "civilization:N",
                 scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                legend=alt.Legend(title="文明"),
+                legend=alt.Legend(title="Nation", symbolOpacity=1),
             ),
             tooltip=[
-                alt.Tooltip("civilization:N", title="文明"),
-                alt.Tooltip("year:Q",         title="年份"),
+                alt.Tooltip("civilization:N", title="Nation"),
+                alt.Tooltip("year:Q",         title="Year"),
                 alt.Tooltip("share:Q",         title="份额", format=".1%"),
                 alt.Tooltip("gdp:Q",           title="GDP",  format=".2f"),
             ],
             order=alt.Order("gdp:Q", sort="descending"),
         )
-        .properties(width="container", height=380, title="全球 GDP 份额演变（1000-1850）")
+        .properties(width="container", height=320)
         .interactive()
     )
     st.altair_chart(share_chart, use_container_width=True)
 
-    # ── 世界领土控制地图（真实地理 + 年份滑块）────────────────────
-    st.subheader("领土控制世界地图")
-    st.caption(
-        "每个国家/地区按控制它的文明着色。"
-        "殖民扩张随 territories 标量增长，按历史优先级依次染色。"
-        "拖动滑块观察不同年份的世界格局演变。"
-    )
+    st.markdown("---")
 
-    # 年份滑块
-    available_years = sorted(df["year"].unique().tolist())
-    map_year = st.select_slider(
-        "选择年份",
-        options=available_years,
-        value=available_years[-1],
-        format_func=lambda y: f"{y} AD",
-    )
+    st.subheader("Leader Timeline")
 
-    # 1. 根据当年领土数据构建 id → civilization 映射表
-    map_year_df  = df[df["year"] == map_year]
-    control_df   = build_control_df(map_year_df)
+    leader_rows = []
+    for y in sorted(power_df["year"].unique()):
+        dy = power_df[power_df["year"] == y]
+        leader = dy.loc[dy["power_raw"].idxmax(), "civilization"]
+        leader_rows.append({"year": y, "leader": leader})
+    leader_df = pd.DataFrame(leader_rows)
 
-    # 2. 底图：用 vega_data.world_110m 的 TopoJSON 渲染国家轮廓
-    #    mark_geoshape 将每个 TopoJSON feature 渲染为多边形；
-    #    未被任何文明控制的国家显示为浅灰色。
-    world_topo = alt.topo_feature(vega_data.world_110m.url, "countries")
-
-    base_map = (
-        alt.Chart(world_topo)
-        .mark_geoshape(fill="#d6e8f0", stroke="#aac4d8", strokeWidth=0.3)
-        .project("naturalEarth1")
-    )
-
-    # 3. 领土着色层：transform_lookup 把 TopoJSON feature.id 与
-    #    control_df 的 id 列关联，按 civilization 字段着色。
-    #    lookup key 是 TopoJSON 里的 id 字段（ISO 3166-1 数值）。
-    territory_map = (
-        alt.Chart(world_topo)
-        .mark_geoshape(stroke="white", strokeWidth=0.25)
-        .transform_lookup(
-            lookup="id",
-            from_=alt.LookupData(
-                data=control_df,
-                key="id",
-                fields=["civilization"],
-            ),
-        )
+    leader_chart = (
+        alt.Chart(leader_df)
+        .mark_point(size=90, filled=True)
         .encode(
-            color=alt.condition(
-                "datum.civilization !== null",
-                alt.Color(
-                    "civilization:N",
-                    scale=alt.Scale(
-                        domain=list(COLOR_MAP.keys()),
-                        range=list(COLOR_MAP.values()),
-                    ),
-                    legend=alt.Legend(title="控制文明"),
-                ),
-                alt.value("#d6e8f0"),   # 未被控制 → 保持底图蓝灰色
-            ),
-            tooltip=[
-                alt.Tooltip("civilization:N", title="控制文明"),
-            ],
-        )
-        .project("naturalEarth1")
-    )
-
-    # 4. GDP 气泡层：叠加在地图上，显示各文明本土的经济规模
-    gdp_bubbles = (
-        alt.Chart(map_year_df)
-        .mark_circle(opacity=0.75, stroke="white", strokeWidth=1.5)
-        .encode(
-            longitude="lon:Q",
-            latitude="lat:Q",
-            size=alt.Size(
-                "gdp:Q",
-                scale=alt.Scale(range=[60, 2800]),
-                legend=alt.Legend(title="GDP"),
-            ),
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y("leader:N", title="Leader",
+                    sort=alt.EncodingSortField(field="year")),
             color=alt.Color(
-                "civilization:N",
+                "leader:N",
                 scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                legend=None,
+                legend=alt.Legend(title="Nation", symbolOpacity=1),
             ),
-            tooltip=[
-                alt.Tooltip("civilization:N",   title="文明"),
-                alt.Tooltip("gdp:Q",            title="GDP",      format=".2f"),
-                alt.Tooltip("gdp_per_capita:Q", title="人均 GDP", format=".3f"),
-                alt.Tooltip("population:Q",     title="人口(M)",  format=".1f"),
-                alt.Tooltip("territories:Q",    title="领土倍数", format=".2f"),
-                alt.Tooltip("tech_composite:Q", title="技术综合", format=".2f"),
-            ],
+            tooltip=["year:Q", "leader:N"],
         )
-        .project("naturalEarth1")
+        .properties(width="container", height=max(120, len(CIVS) * 55))
+        .interactive()
+    )
+    st.altair_chart(leader_chart, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Final Rankings")
+    final_power = power_df[power_df["year"] == power_df["year"].max()].copy()
+    final_power = final_power.sort_values("power_raw", ascending=False)
+    final_power["排名"] = range(1, len(final_power) + 1)
+    display_cols = ["排名", "civilization", "gdp", "gdp_per_capita",
+                    "military_str", "territories", "tech_composite", "trade_income"]
+    rename_map = {
+        "civilization": "文明", "gdp": "GDP", "gdp_per_capita": "人均GDP",
+        "military_str": "军事实力", "territories": "领土", "tech_composite": "技术综合",
+        "trade_income": "贸易收益",
+    }
+    st.dataframe(
+        final_power[display_cols].rename(columns=rename_map).reset_index(drop=True),
+        use_container_width=True,
     )
 
-    # 5. 文明名标签
-    labels = (
-        alt.Chart(map_year_df)
-        .mark_text(fontSize=9, fontWeight="bold", color="#222", dy=-13)
-        .encode(
-            longitude="lon:Q",
-            latitude="lat:Q",
-            text="civilization:N",
-        )
-        .project("naturalEarth1")
-    )
-
-    world_map = (
-        alt.layer(base_map, territory_map, gdp_bubbles, labels)
-        .properties(
-            width="container",
-            height=430,
-            title=f"世界领土控制格局 — {map_year} AD",
-        )
-    )
-    st.altair_chart(world_map, use_container_width=True)
-
-    # ── 事件日志 ──
     if events_on and not event_df.empty:
-        with st.expander("📋 历史随机事件记录（点击展开）"):
+        with st.expander("📋 随机扰动事件记录"):
             st.dataframe(
-                event_df[["year","era","event","target","description"]].sort_values("year"),
-                use_container_width=True, height=280,
+                event_df[["year", "era", "event", "target", "description"]].sort_values("year"),
+                use_container_width=True, height=240,
             )
 
 
-# ═════════════════════════════════════════════
+# ══════════════════════════════════════════════
 # Tab 2：经济轨迹
-# ═════════════════════════════════════════════
+# ══════════════════════════════════════════════
 with tab2:
-    st.header("📈 经济发展轨迹详细分析")
 
-    # ── 4 指标折线图（2×2 用 st.columns 实现，避免 hconcat 宽度失效）──
-    st.subheader("四维度经济发展轨迹")
-    st.caption("背景色带区分历史时期；鼠标悬停可查看具体数值；可拖拽缩放。")
-
-    def make_panel(y_field, y_title, show_legend=False):
-        """折线图 + 时代色带，width='container' 在独立列中能正确撑满。"""
-        lines = (
-            alt.Chart(df_flt)
-            .mark_line(strokeWidth=2)
-            .encode(
-                x=alt.X("year:Q", title="年份"),
-                y=alt.Y(f"{y_field}:Q", title=y_title),
-                color=alt.Color(
-                    "civilization:N",
-                    scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                    legend=alt.Legend(title="文明") if show_legend else None,
-                ),
-                tooltip=["civilization:N", "year:Q", f"{y_field}:Q"],
-            )
-        )
-        return (
-            alt.layer(era_bands(), lines)
-            .properties(width="container", height=280)
-            .interactive()
-        )
-
-    # 每个 st.columns 列各占 50%，altair width="container" 才能正确填满列宽
+    # 四格布局
     c1, c2 = st.columns(2)
     with c1:
-        st.altair_chart(make_panel("gdp", "GDP（相对单位）", show_legend=True),
-                        use_container_width=True)
+        st.altair_chart(
+            line_chart(df, "gdp", "GDP（相对单位）", COLOR_MAP, height=280, title="GDP 总量"),
+            use_container_width=True,
+        )
     with c2:
-        st.altair_chart(make_panel("gdp_per_capita", "人均 GDP"),
-                        use_container_width=True)
+        st.altair_chart(
+            line_chart(df, "gdp_per_capita", "人均 GDP", COLOR_MAP, height=280, title="人均 GDP"),
+            use_container_width=True,
+        )
 
     c3, c4 = st.columns(2)
     with c3:
-        st.altair_chart(make_panel("population", "人口（百万）"),
-                        use_container_width=True)
+        st.altair_chart(
+            line_chart(df, "population", "人口（百万）", COLOR_MAP, height=280, title="人口规模"),
+            use_container_width=True,
+        )
     with c4:
-        st.altair_chart(make_panel("military_str", "军事实力"),
-                        use_container_width=True)
+        # 计算 GDP 增长率（对数差分）
+        growth_df = df.copy().sort_values(["civilization", "year"])
+        growth_df["gdp_growth"] = growth_df.groupby("civilization")["gdp"].pct_change() * 100
+        growth_df = growth_df.dropna(subset=["gdp_growth"])
+        st.altair_chart(
+            line_chart(growth_df, "gdp_growth", "GDP 增长率（%）", COLOR_MAP,
+                       height=280, title="GDP 增长率"),
+            use_container_width=True,
+        )
 
-    # ── 大分流放大图 ─────────────────────────────────────
-    st.subheader('🔍 "大分流"放大：1700-1850 年人均 GDP')
-    st.caption("工业革命（紫色背景）期间，西北欧与其他地区的人均 GDP 产生急剧分化。")
+    st.markdown("---")
 
-    late_df = df_flt[df_flt["year"] >= 1700]
-    diverge_chart = line_with_bands(
-        late_df, "gdp_per_capita", "人均 GDP",
-        color_map=COLOR_MAP, height=320,
-        title="大分流：人均 GDP 分化（1700-1850）",
+    st.subheader("Avg GDP by Era")
+    era_map = {"MEDIEVAL": "农业时代", "DISCOVERY": "扩张时代",
+               "MERCANTILE": "商业时代", "INDUSTRIAL": "工业时代"}
+    df["era_label"] = df["era"].map(era_map)
+    era_avg = df.groupby(["civilization", "era_label"])["gdp"].mean().reset_index()
+    era_avg.columns = ["civilization", "era_label", "avg_gdp"]
+
+    era_order = ["农业时代", "扩张时代", "商业时代", "工业时代"]
+    era_chart = (
+        alt.Chart(era_avg)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("era_label:N", title="发展阶段",
+                    sort=era_order,
+                    axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("avg_gdp:Q", title="阶段平均 GDP"),
+            color=alt.Color(
+                "civilization:N",
+                scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
+                legend=alt.Legend(title="Nation", symbolOpacity=1),
+            ),
+            xOffset="civilization:N",
+            tooltip=["civilization:N", "era_label:N",
+                     alt.Tooltip("avg_gdp:Q", title="均值GDP", format=".2f")],
+        )
+        .properties(width="container", height=320, title="各阶段平均 GDP（分组柱状图）")
     )
-    st.altair_chart(diverge_chart, use_container_width=True)
+    st.altair_chart(era_chart, use_container_width=True)
 
-    # ── 1850年横向对比条形图 ──────────────────────────────
-    st.subheader("1850年终值横向对比")
+    st.markdown("---")
+
+    st.subheader("Final Snapshot")
     metric_opt = st.radio(
-        "选择指标",
+        "指标",
         ["gdp", "gdp_per_capita", "population", "tech_composite"],
         horizontal=True,
         format_func=lambda x: {
-            "gdp":"GDP总量","gdp_per_capita":"人均GDP",
-            "population":"人口","tech_composite":"技术水平",
+            "gdp": "GDP总量", "gdp_per_capita": "人均GDP",
+            "population": "人口", "tech_composite": "技术水平",
         }[x],
     )
-    final_all = df[df["year"] == df["year"].max()].sort_values(metric_opt, ascending=False)
-    bar_chart = (
-        alt.Chart(final_all)
+    bar = (
+        alt.Chart(final_df.sort_values(metric_opt, ascending=False))
         .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
         .encode(
-            x=alt.X("civilization:N",
-                    sort=alt.EncodingSortField(field=metric_opt, order="descending"),
-                    title="文明"),
+            x=alt.X("civilization:N", sort=alt.EncodingSortField(field=metric_opt, order="descending"),
+                    title="Nation"),
             y=alt.Y(f"{metric_opt}:Q", title=metric_opt),
             color=alt.Color(
                 "civilization:N",
                 scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
                 legend=None,
             ),
-            tooltip=["civilization:N", f"{metric_opt}:Q", "strategy:N"],
+            tooltip=["civilization:N", f"{metric_opt}:Q"],
         )
-        .properties(width="container", height=320, title=f"1850年 {metric_opt} 排名")
+        .properties(width="container", height=300)
     )
-    st.altair_chart(bar_chart, use_container_width=True)
+    st.altair_chart(bar, use_container_width=True)
 
+    st.markdown("---")
 
-# ═════════════════════════════════════════════
-# Tab 3：技术竞赛
-# ═════════════════════════════════════════════
-with tab3:
-    st.header("🔬 技术竞赛与研发路径")
-
-    TECH_FIELDS = {
-        "tech_agri": "🌾 农业技术",
-        "tech_nav":  "⛵ 航海技术",
-        "tech_mil":  "⚔️ 军事技术",
-        "tech_ind":  "🏭 工业技术",
-        "tech_com":  "💰 商业技术",
-    }
-
-    # ── 技术领域选择折线图 ────────────────────────────────
-    tech_sel = st.selectbox("选择技术领域", list(TECH_FIELDS.keys()),
-                            format_func=lambda x: TECH_FIELDS[x])
-
-    tech_chart = line_with_bands(
-        df_flt, tech_sel, f"{TECH_FIELDS[tech_sel]}（0-10）",
-        color_map=COLOR_MAP, height=320,
-        title=f"{TECH_FIELDS[tech_sel]} 发展轨迹",
+    st.subheader("GDP Breakdown  (base / trade / colonial)")
+    decomp_df = df.copy()
+    decomp_df["base_gdp"] = (
+        decomp_df["gdp"] - decomp_df["trade_income"] - decomp_df["colonial_income"]
+    ).clip(lower=0)
+    decomp_long = pd.melt(
+        decomp_df,
+        id_vars=["civilization", "year"],
+        value_vars=["base_gdp", "trade_income", "colonial_income"],
+        var_name="来源",
+        value_name="数值",
     )
-    st.altair_chart(tech_chart, use_container_width=True)
-
-    # ── 五大技术领域全景对比（2+2+1 布局，每图独立列撑满宽度）──
-    st.subheader("五大技术领域全景对比")
-    st.caption("可以看出各文明的『技术专精』路径：葡西的航海、英国的工业、荷兰的商业……")
-
-    def tech_line(field, label):
-        lines = (
-            alt.Chart(df_flt)
-            .mark_line(strokeWidth=1.8)
-            .encode(
-                x=alt.X("year:Q", title="年份"),
-                y=alt.Y(f"{field}:Q", title="水平(0-10)",
-                        scale=alt.Scale(domain=[0, 10])),
-                color=alt.Color(
-                    "civilization:N",
-                    scale=alt.Scale(domain=list(COLOR_MAP.keys()),
-                                    range=list(COLOR_MAP.values())),
-                    legend=None,
+    decomp_long["来源"] = decomp_long["来源"].map({
+        "base_gdp": "国内基础", "trade_income": "贸易收益", "colonial_income": "殖民地收益",
+    })
+    ncivs = len(CIVS)
+    facet_cols = 3 if ncivs >= 3 else ncivs
+    panel_w = max(180, min(300, 900 // facet_cols))
+    decomp_area = (
+        alt.Chart(decomp_long)
+        .mark_area(opacity=0.88)
+        .encode(
+            x=alt.X("year:Q", title="Year", axis=alt.Axis(labelFontSize=9)),
+            y=alt.Y("数值:Q", title="GDP", stack="zero", axis=alt.Axis(labelFontSize=9)),
+            color=alt.Color(
+                "来源:N",
+                scale=alt.Scale(
+                    domain=["国内基础", "贸易收益", "殖民地收益"],
+                    range=["#264653", "#2a9d8f", "#e9c46a"],
                 ),
-                tooltip=["civilization:N", "year:Q", f"{field}:Q"],
-            )
+                legend=alt.Legend(title="来源", symbolOpacity=1),
+            ),
+            tooltip=["civilization:N", "year:Q", "来源:N",
+                     alt.Tooltip("数值:Q", title="GDP", format=".3f")],
         )
-        return (
-            alt.layer(era_bands(), lines)
-            .properties(width="container", height=220, title=label)
-            .interactive()
+        .properties(width=panel_w, height=160)
+        .facet(facet=alt.Facet("civilization:N", header=alt.Header(titleFontSize=12)), columns=facet_cols)
+    )
+    st.altair_chart(decomp_area, use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# Tab 3：贸易与领土
+# ══════════════════════════════════════════════
+with tab3:
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(
+            line_chart(df, "trade_income", "贸易收益", COLOR_MAP, height=300, title="Trade Income"),
+            use_container_width=True,
+        )
+    with c2:
+        st.altair_chart(
+            line_chart(df, "colonial_income", "殖民地收益", COLOR_MAP, height=300, title="殖民地收益演变"),
+            use_container_width=True,
         )
 
-    row_a1, row_a2 = st.columns(2)
-    fields_list = list(TECH_FIELDS.items())
-    with row_a1:
-        st.altair_chart(tech_line(fields_list[0][0], fields_list[0][1]),
-                        use_container_width=True)
-    with row_a2:
-        st.altair_chart(tech_line(fields_list[1][0], fields_list[1][1]),
-                        use_container_width=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        st.altair_chart(
+            line_chart(df, "territories", "Territory", COLOR_MAP, height=300, title="Territory"),
+            use_container_width=True,
+        )
+    with c4:
+        st.altair_chart(
+            line_chart(df, "trade_openness", "Openness", COLOR_MAP, height=300, title="Openness"),
+            use_container_width=True,
+        )
 
-    row_b1, row_b2 = st.columns(2)
-    with row_b1:
-        st.altair_chart(tech_line(fields_list[2][0], fields_list[2][1]),
-                        use_container_width=True)
-    with row_b2:
-        st.altair_chart(tech_line(fields_list[3][0], fields_list[3][1]),
-                        use_container_width=True)
+    st.markdown("---")
 
-    # 工业技术单独全宽（最重要，值得更大展示）
-    st.altair_chart(tech_line(fields_list[4][0], fields_list[4][1]),
-                    use_container_width=True)
+    st.subheader("Trade × GDP (final)")
+    scatter = (
+        alt.Chart(final_df)
+        .mark_circle(opacity=0.85, stroke="white", strokeWidth=1.5)
+        .encode(
+            x=alt.X("trade_income:Q", title="Trade Income"),
+            y=alt.Y("gdp:Q",          title="GDP"),
+            size=alt.Size("population:Q", scale=alt.Scale(range=[150, 1500]),
+                          legend=alt.Legend(title="人口", symbolOpacity=1)),
+            color=alt.Color(
+                "civilization:N",
+                scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
+                legend=alt.Legend(title="Nation", symbolOpacity=1),
+            ),
+            tooltip=["civilization:N", "gdp:Q", "trade_income:Q",
+                     "population:Q", "territories:Q", "trade_openness:Q"],
+        )
+        .properties(width="container", height=380)
+    )
+    st.altair_chart(scatter, use_container_width=True)
 
-    # ── 技术结构雷达图（极坐标面积图）────────────────────
-    st.subheader("技术结构雷达图对比")
-    st.caption("展示 1000 年和 1850 年各文明的技术专精方向。"
-               "面积越大 = 综合技术越强；形状不对称 = 专精某一领域。")
+    st.markdown("---")
 
-    radar_civs = st.multiselect(
-        "选择对比文明（建议 2-4 个）",
-        options=df["civilization"].unique().tolist(),
-        default=(show_civs or ALL_CIVS)[:3],
+    st.subheader("Resource Complementarity")
+    trade_matrix = compute_trade_matrix(mode_name)
+    heatmap = (
+        alt.Chart(trade_matrix)
+        .mark_rect(stroke="white", strokeWidth=0.5)
+        .encode(
+            x=alt.X("进口方:N", title="进口方"),
+            y=alt.Y("出口方:N", title="出口方"),
+            color=alt.Color(
+                "互补度:Q",
+                scale=alt.Scale(scheme="blues"),
+                legend=alt.Legend(title="互补度", symbolOpacity=1),
+            ),
+            tooltip=["出口方:N", "进口方:N", alt.Tooltip("互补度:Q", format=".3f")],
+        )
+        .properties(width="container", height=max(250, len(CIVS) * 60))
+    )
+    text_layer = (
+        alt.Chart(trade_matrix)
+        .mark_text(fontSize=12, fontWeight="bold", color="white")
+        .encode(
+            x="进口方:N",
+            y="出口方:N",
+            text=alt.Text("互补度:Q", format=".2f"),
+            opacity=alt.condition(
+                alt.datum["互补度"] > 0.05, alt.value(1), alt.value(0)
+            ),
+        )
+    )
+    st.altair_chart((heatmap + text_layer).properties(width="container"), use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# Tab 4：国家关系
+# ══════════════════════════════════════════════
+with tab4:
+    st.subheader("GDP Ratio")
+
+    focus_civ = st.selectbox("选择参照文明", CIVS, key="focus_relation")
+    focus_df  = df[df["civilization"] == focus_civ][["year", "gdp"]].rename(columns={"gdp": "gdp_focus"})
+
+    ratio_rows = []
+    for other in CIVS:
+        if other == focus_civ:
+            continue
+        other_df = df[df["civilization"] == other][["year", "gdp"]].rename(columns={"gdp": "gdp_other"})
+        merged = focus_df.merge(other_df, on="year")
+        merged["ratio"] = merged["gdp_focus"] / merged["gdp_other"].replace(0, np.nan)
+        merged["对比"] = f"{focus_civ} / {other}"
+        ratio_rows.append(merged[["year", "ratio", "对比"]])
+    ratio_df = pd.concat(ratio_rows, ignore_index=True)
+
+    ratio_chart = (
+        alt.Chart(ratio_df)
+        .mark_line(strokeWidth=2, point=alt.OverlayMarkDef(opacity=0, size=180))
+        .encode(
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y("ratio:Q", title="GDP ratio (focus/other)"),
+            color=alt.Color("对比:N", legend=alt.Legend(title="Ratio", symbolOpacity=1)),
+            tooltip=["对比:N", "year:Q", alt.Tooltip("ratio:Q", format=".2f")],
+        )
+    )
+    rule = alt.Chart(pd.DataFrame({"y": [1]})).mark_rule(
+        color="gray", strokeDash=[6, 3], strokeWidth=1.5
+    ).encode(y="y:Q")
+    st.altair_chart(
+        alt.layer(era_bands(), ratio_chart, rule)
+        .properties(width="container", height=320)
+        .interactive(),
+        use_container_width=True,
     )
 
+    st.markdown("---")
+
+    st.subheader("Military")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(
+            line_chart(df, "military_str", "Military", COLOR_MAP, height=280, title="Military"),
+            use_container_width=True,
+        )
+    with c2:
+        # 军事 / GDP 比率（军事效率）
+        mil_eff = df.copy()
+        mil_eff["mil_eff"] = mil_eff["military_str"] / mil_eff["gdp"].replace(0, np.nan)
+        st.altair_chart(
+            line_chart(mil_eff, "mil_eff", "军事/GDP 比", COLOR_MAP, height=280,
+                       title="Military / GDP"),
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+
+    st.subheader("Tech Focus")
+
+    tech_color_scale = alt.Scale(
+        domain=list(TECH_LABELS.keys()),
+        range=list(TECH_COLORS.values()),
+    )
+    decision_chart = (
+        alt.Chart(df)
+        .mark_rect(stroke="white", strokeWidth=0.3)
+        .encode(
+            x=alt.X("year:Q",            title="Year",
+                    axis=alt.Axis(format="d", tickCount=10)),
+            y=alt.Y("civilization:N",    title="Nation",
+                    sort=list(reversed(CIVS))),
+            color=alt.Color(
+                "decision_tech:N",
+                scale=tech_color_scale,
+                legend=alt.Legend(
+                    title="Tech Focus",
+                    symbolOpacity=1,
+                    labelExpr=(
+                        "datum.value === 'agriculture' ? '🌾 农业' : "
+                        "datum.value === 'navigation'  ? '⛵ 航海' : "
+                        "datum.value === 'military'    ? '⚔️ 军事' : "
+                        "datum.value === 'industry'    ? '🏭 工业' : "
+                        "'💰 商业'"
+                    ),
+                ),
+            ),
+            tooltip=[
+                "civilization:N", "year:Q",
+                alt.Tooltip("decision_tech:N",   title="Tech Focus"),
+                alt.Tooltip("decision_expand:Q", title="Expand"),
+                alt.Tooltip("decision_trade:N",  title="Trade Policy"),
+            ],
+        )
+        .properties(width="container", height=max(120, len(CIVS) * 48))
+    )
+    st.altair_chart(decision_chart, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Trade Policy")
+
+    trade_color_scale = alt.Scale(
+        domain=["open", "balanced", "closed"],
+        range=["#2a9d8f", "#e9c46a", "#e63946"],
+    )
+    trade_policy_chart = (
+        alt.Chart(df)
+        .mark_rect(stroke="white", strokeWidth=0.3)
+        .encode(
+            x=alt.X("year:Q", title="Year", axis=alt.Axis(format="d", tickCount=10)),
+            y=alt.Y("civilization:N", title="Nation", sort=list(reversed(CIVS))),
+            color=alt.Color(
+                "decision_trade:N",
+                scale=trade_color_scale,
+                legend=alt.Legend(
+                    title="Trade Policy", symbolOpacity=1,
+                    labelExpr=(
+                        "datum.value === 'open' ? '开放' : "
+                        "datum.value === 'balanced' ? '均衡' : '封闭'"
+                    ),
+                ),
+            ),
+            tooltip=[
+                "civilization:N", "year:Q",
+                alt.Tooltip("decision_trade:N", title="Trade Policy"),
+                alt.Tooltip("trade_openness:Q", title="实际开放度", format=".2f"),
+            ],
+        )
+        .properties(width="container", height=max(120, len(CIVS) * 48))
+    )
+    st.altair_chart(trade_policy_chart, use_container_width=True)
+
+    # ── 扩张等级演变 ───────────────────────────
+    st.subheader("Expansion")
+    expand_chart = (
+        alt.Chart(df)
+        .mark_rect(stroke="white", strokeWidth=0.3)
+        .encode(
+            x=alt.X("year:Q", title="Year", axis=alt.Axis(format="d", tickCount=10)),
+            y=alt.Y("civilization:N", title="Nation", sort=list(reversed(CIVS))),
+            color=alt.Color(
+                "decision_expand:O",
+                scale=alt.Scale(domain=[0, 1, 2], range=["#d1e8ff", "#457b9d", "#1d3557"]),
+                legend=alt.Legend(
+                    title="Expand", symbolOpacity=1,
+                    labelExpr=(
+                        "datum.value === 0 ? '保守' : "
+                        "datum.value === 1 ? '温和扩张' : '激进殖民'"
+                    ),
+                ),
+            ),
+            tooltip=[
+                "civilization:N", "year:Q",
+                alt.Tooltip("decision_expand:O", title="Expand"),
+                alt.Tooltip("territories:Q",     title="当前领土", format=".2f"),
+            ],
+        )
+        .properties(width="container", height=max(120, len(CIVS) * 48))
+    )
+    st.altair_chart(expand_chart, use_container_width=True)
+
+
+# ══════════════════════════════════════════════
+# Tab 5：技术路线
+# ══════════════════════════════════════════════
+with tab5:
+    tech_sel = st.selectbox(
+        "Tech domain",
+        list(TECH_LABELS.keys()),
+        format_func=lambda x: TECH_LABELS[x],
+    )
+    st.altair_chart(
+        line_chart(df, f"tech_{tech_sel[:3]}", f"{TECH_LABELS[tech_sel]}（0-10）",
+                   COLOR_MAP, height=300, title=f"{TECH_LABELS[tech_sel]} 发展轨迹"),
+        use_container_width=True,
+    )
+
+    st.markdown("---")
+
+    st.subheader("All Tech Domains")
+    field_pairs = [
+        ("tech_agri", "🌾 农业技术"),
+        ("tech_nav",  "⛵ 航海技术"),
+        ("tech_mil",  "⚔️ 军事技术"),
+        ("tech_ind",  "🏭 工业技术"),
+    ]
+    r1c1, r1c2 = st.columns(2)
+    r2c1, r2c2 = st.columns(2)
+    for col, (field, label) in zip([r1c1, r1c2, r2c1, r2c2], field_pairs):
+        with col:
+            st.altair_chart(
+                line_chart(df, field, "水平(0-10)", COLOR_MAP, height=220, title=label),
+                use_container_width=True,
+            )
+    st.altair_chart(
+        line_chart(df, "tech_com", "水平(0-10)", COLOR_MAP, height=220, title="💰 商业技术"),
+        use_container_width=True,
+    )
+
+    st.markdown("---")
+
+    st.subheader("Tech Radar")
+    radar_civs = st.multiselect("Nations", CIVS, default=CIVS[:min(4, len(CIVS))])
     if radar_civs:
-        domains_cn = {"tech_agri":"农业","tech_nav":"航海","tech_mil":"军事",
-                      "tech_ind":"工业","tech_com":"商业"}
+        domains_cn = {"tech_agri": "农业", "tech_nav": "航海", "tech_mil": "军事",
+                      "tech_ind": "工业", "tech_com": "商业"}
 
         def make_radar_df(year_val):
             rows = []
             dy = df[df["year"] == year_val]
             for civ in radar_civs:
                 row = dy[dy["civilization"] == civ]
-                if row.empty: continue
+                if row.empty:
+                    continue
                 for field, cn in domains_cn.items():
                     rows.append({
-                        "civilization": civ,
-                        "domain": cn,
-                        "value": row[field].values[0],
-                        "year": year_val,
+                        "civilization": civ, "domain": cn,
+                        "value": row[field].values[0], "year": year_val,
                     })
             return pd.DataFrame(rows)
 
         col_r1, col_r2 = st.columns(2)
         for col_w, yr in [(col_r1, df["year"].min()), (col_r2, df["year"].max())]:
             rdf = make_radar_df(yr)
-            # Altair 极坐标：theta = 技术领域，radius = 技术值（0-10）
-            # width/height 给固定值而非 "container"，极坐标布局不支持弹性宽度
             radar = (
                 alt.Chart(rdf)
-                .mark_line(point=True, strokeWidth=2.2, filled=False)
+                .mark_line(point=True, strokeWidth=2, filled=False)
                 .encode(
                     theta=alt.Theta("domain:N", sort=list(domains_cn.values())),
                     radius=alt.Radius("value:Q", scale=alt.Scale(domain=[0, 10])),
@@ -632,394 +842,374 @@ with tab3:
                         "civilization:N",
                         scale=alt.Scale(domain=list(COLOR_MAP.keys()),
                                         range=list(COLOR_MAP.values())),
-                        legend=alt.Legend(title="文明"),
+                        legend=alt.Legend(title="Nation", symbolOpacity=1),
                     ),
                     tooltip=["civilization:N", "domain:N", "value:Q"],
                 )
             )
-            radar_fill = radar.mark_arc(opacity=0.12, innerRadius=0)
+            radar_fill = radar.mark_arc(opacity=0.1, innerRadius=0)
+            era_label = "Start" if yr == df["year"].min() else "End"
             with col_w:
                 st.altair_chart(
                     alt.layer(radar_fill, radar)
-                    .properties(width=340, height=340, title=f"{yr} 年技术结构雷达图"),
+                    .properties(width=340, height=340, title=f"{era_label}"),
                     use_container_width=True,
                 )
 
-    # ── 工业技术领先者时间线 ──────────────────────────────
-    st.subheader("工业技术领先者历史时间线")
-    leader_rows = []
+    st.markdown("---")
+
+    st.subheader("Industrial Tech Leader")
+    ind_leader_rows = []
     for y in sorted(df["year"].unique()):
         dy = df[df["year"] == y]
         leader = dy.loc[dy["tech_ind"].idxmax(), "civilization"]
-        leader_rows.append({"year": y, "leader": leader})
-    leader_df = pd.DataFrame(leader_rows)
-
-    leader_chart = (
-        alt.Chart(leader_df)
+        ind_leader_rows.append({"year": y, "leader": leader})
+    ind_leader_df = pd.DataFrame(ind_leader_rows)
+    ind_chart = (
+        alt.Chart(ind_leader_df)
         .mark_point(size=80, filled=True)
         .encode(
-            x=alt.X("year:Q", title="年份"),
-            y=alt.Y("leader:N", title="领先文明",
-                    sort=alt.EncodingSortField(field="year")),
+            x=alt.X("year:Q", title="Year"),
+            y=alt.Y("leader:N", title="Industrial leader"),
             color=alt.Color(
                 "leader:N",
                 scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
                 legend=None,
             ),
-            tooltip=["year:Q","leader:N"],
+            tooltip=["year:Q", "leader:N"],
         )
-        .properties(width="container", height=220,
-                    title="工业技术历史领先者（哪个文明最先突破？）")
-    )
-    st.altair_chart(leader_chart, use_container_width=True)
-
-
-# ═════════════════════════════════════════════
-# Tab 4：贸易与殖民
-# ═════════════════════════════════════════════
-with tab4:
-    st.header("🚢 贸易网络与殖民扩张")
-
-    # 上行：贸易收益 + 殖民收益
-    col_t1, col_t2 = st.columns(2)
-    with col_t1:
-        st.altair_chart(
-            line_with_bands(df_flt, "trade_income", "贸易收益", color_map=COLOR_MAP,
-                            height=360, title="贸易收益演变"),
-            use_container_width=True,
-        )
-    with col_t2:
-        st.altair_chart(
-            line_with_bands(df_flt, "colonial_income", "殖民地收益", color_map=COLOR_MAP,
-                            height=360, title="殖民地收益演变"),
-            use_container_width=True,
-        )
-
-    # 贸易开放度
-    st.altair_chart(
-        line_with_bands(df_flt, "trade_openness", "贸易开放度（0-1）",
-                        color_map=COLOR_MAP, height=360,
-                        title="贸易开放度演变（0=闭关锁国，1=完全自由贸易）"),
-        use_container_width=True,
-    )
-
-    # 领土扩张（堆叠面积图）
-    st.subheader("殖民版图扩张")
-    terr_chart = (
-        alt.Chart(df_flt)
-        .mark_area(opacity=0.7)
-        .encode(
-            x=alt.X("year:Q", title="年份"),
-            y=alt.Y("territories:Q", title="领土（1=本土）", stack=None),
-            color=alt.Color(
-                "civilization:N",
-                scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                legend=alt.Legend(title="文明"),
-            ),
-            tooltip=["civilization:N","year:Q","territories:Q"],
-        )
-        .properties(width="container", height=360, title="各文明控制领土扩张")
+        .properties(width="container", height=max(100, len(CIVS) * 50))
         .interactive()
     )
-    st.altair_chart(alt.layer(era_bands(), terr_chart), use_container_width=True)
-
-    # ── 贸易 vs GDP 散点图（1850年截面）──────────────────
-    st.subheader("1850年：贸易收益 vs GDP（贸易对经济规模的贡献）")
-    scatter_trade = (
-        alt.Chart(final)
-        .mark_circle(size=160, opacity=0.85)
-        .encode(
-            x=alt.X("trade_income:Q", title="贸易收益"),
-            y=alt.Y("gdp:Q",          title="GDP"),
-            color=alt.Color(
-                "civilization:N",
-                scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                legend=alt.Legend(title="文明"),
-            ),
-            size=alt.Size("population:Q", scale=alt.Scale(range=[100,1200]),
-                          legend=alt.Legend(title="人口")),
-            tooltip=["civilization:N","gdp:Q","trade_income:Q","population:Q","strategy:N"],
-        )
-        .properties(width="container", height=400,
-                    title="贸易收益与 GDP 总量的关系（1850年）")
-    )
-    st.altair_chart(scatter_trade, use_container_width=True)
+    st.altair_chart(ind_chart, use_container_width=True)
 
 
-# ═════════════════════════════════════════════
-# Tab 5：反事实分析
-# ═════════════════════════════════════════════
-with tab5:
-    st.header("🔀 反事实历史实验")
-    st.markdown("""
-    **核心问题**：大分流是历史的必然还是偶然？
-
-    通过修改关键参数（地理条件、策略选择），推演替代历史路径，
-    评估地理禀赋与决策风格各自的贡献。以下实验均关闭随机事件，
-    排除随机扰动，使轨迹差异纯粹来自参数变化。
-    """)
-
-    cf_results = run_counterfactuals(seed)
-
-    # 选择分析文明
-    cf_civ = st.selectbox("选择要分析的文明",
-                          ["中华帝国", "西北欧（荷英）", "伊比利亚（葡西）"])
-
-    # 合并各场景为单 DataFrame
-    cf_rows = []
-    for scenario, sdf in cf_results.items():
-        d = sdf[sdf["civilization"] == cf_civ].copy()
-        d["scenario"] = scenario
-        cf_rows.append(d)
-    cf_df = pd.concat(cf_rows, ignore_index=True)
-
-    # Altair 折线图对比各场景
-    cf_chart = (
-        alt.Chart(cf_df)
-        .mark_line(strokeWidth=2.5)
-        .encode(
-            x=alt.X("year:Q", title="年份"),
-            y=alt.Y("gdp:Q",  title="GDP"),
-            color=alt.Color("scenario:N", legend=alt.Legend(title="场景")),
-            strokeDash=alt.StrokeDash("scenario:N",
-                legend=alt.Legend(title="场景"),
-                scale=alt.Scale(
-                    domain=list(cf_results.keys()),
-                    range=[[1,0],[6,2],[4,2,1,2],[2,2],[8,2]],
-                )),
-            tooltip=["scenario:N","year:Q","gdp:Q"],
-        )
-        .properties(width="container", height=380,
-                    title=f"{cf_civ} — 反事实路径对比")
-        .interactive()
-    )
-    st.altair_chart(alt.layer(era_bands(), cf_chart), use_container_width=True)
-
-    # 终值对比表
-    st.subheader("1850年终值对比（各反事实场景）")
-    final_year = list(cf_results.values())[0]["year"].max()
-    cf_table_rows = []
-    for sname, sdf in cf_results.items():
-        d = sdf[(sdf["civilization"] == cf_civ) & (sdf["year"] == final_year)]
-        if not d.empty:
-            cf_table_rows.append({
-                "场景": sname,
-                "GDP": round(d["gdp"].values[0], 2),
-                "人均GDP": round(d["gdp_per_capita"].values[0], 4),
-                "工业技术": round(d["tech_ind"].values[0], 2),
-                "领土": round(d["territories"].values[0], 2),
-            })
-    cf_tbl = pd.DataFrame(cf_table_rows)
-    base_gdp = cf_tbl[cf_tbl["场景"] == "历史基准"]["GDP"].values
-    if len(base_gdp):
-        cf_tbl["vs基准(%)"] = ((cf_tbl["GDP"] / base_gdp[0] - 1) * 100).round(1)
-    st.dataframe(cf_tbl, use_container_width=True)
-
-    # 全局 GDP 总量对比
-    st.subheader("全球 GDP 总量对比（各反事实场景）")
-    world_rows = []
-    for sname, sdf in cf_results.items():
-        wg = sdf.groupby("year")["gdp"].sum().reset_index()
-        wg["scenario"] = sname
-        world_rows.append(wg)
-    world_df = pd.concat(world_rows, ignore_index=True)
-
-    world_chart = (
-        alt.Chart(world_df)
-        .mark_line(strokeWidth=2)
-        .encode(
-            x=alt.X("year:Q", title="年份"),
-            y=alt.Y("gdp:Q",  title="全球 GDP 总量"),
-            color=alt.Color("scenario:N", legend=alt.Legend(title="场景")),
-            tooltip=["scenario:N","year:Q","gdp:Q"],
-        )
-        .properties(width="container", height=320,
-                    title="全球 GDP 总量（各反事实场景对比）")
-        .interactive()
-    )
-    st.altair_chart(alt.layer(era_bands(), world_chart), use_container_width=True)
-
-    st.info("""
-    📌 **解读提示**：
-    - **中国高海岸**：郑和下西洋若坚持下去，中国获得与葡萄牙相当的海岸优势，
-      大发现时代的轨迹会有多大改变？
-    - **中国工业先行**：如果清朝在 1700 年代主动推进工业化，而非等到被动冲击？
-    - **西北欧无煤炭**：英国工业革命的地理必然性——煤炭是充分还是必要条件？
-    """)
-
-
-# ═════════════════════════════════════════════
-# Tab 6：ML 策略分析
-# ═════════════════════════════════════════════
+# ══════════════════════════════════════════════
+# Tab 6：模式对比
+# ══════════════════════════════════════════════
 with tab6:
-    st.header("🤖 机器学习策略涌现分析")
-    st.markdown("""
-    使用 **Q-Learning 强化学习** 训练三个智能体，以不同目标函数优化：
-    | 智能体 | 驱动文明 | 奖励函数 | 预期涌现策略 |
-    |--------|----------|---------|------------|
-    | RL_GDP   | 西北欧（荷英）  | GDP 增长率最大化 | 工业先行（类英国）|
-    | RL_Power | 伊比利亚（葡西）| 综合国力最大化   | 航海扩张（类葡西）|
-    | RL_Trade | 奥斯曼帝国      | 贸易收益最大化   | 商业开放（类荷兰）|
 
-    **核心假设**：历史上国家的决策行为，是对某种隐含目标的优化结果。
-    如果 RL 智能体学到的策略与历史原型相似，则支持这一假说。
-    """)
+    if st.button("Run all modes", type="primary"):
+        all_results = run_all_modes(seed, events_on, noise_lvl)
 
-    if st.button("🚀 开始训练 RL 智能体", type="primary"):
-        with st.spinner(f"训练 {rl_eps} 轮，约需 15-30 秒..."):
-            rl_df, curves, strat_summary = run_with_rl(seed, rl_eps)
-        st.success("训练完成！")
-
-        # ── 训练学习曲线 ───────────────────────────────
-        st.subheader("Q-Learning 训练曲线")
-        st.caption("纵轴为每轮模拟结束时（1850年）的 GDP；曲线上升说明智能体在学习有效策略。")
-
-        curve_rows = []
-        for civ_name, vals in curves.items():
-            for ep, v in enumerate(vals):
-                curve_rows.append({"episode": ep + 1, "gdp": v, "agent": civ_name})
-        curve_df = pd.DataFrame(curve_rows)
-
-        if not curve_df.empty:
-            # 原始值（细线）+ 移动平均（粗线）
-            curve_df["smooth"] = (
-                curve_df.groupby("agent")["gdp"]
-                .transform(lambda x: x.rolling(5, min_periods=1).mean())
-            )
-            raw_line = (
-                alt.Chart(curve_df)
-                .mark_line(opacity=0.3, strokeWidth=1)
-                .encode(
-                    x=alt.X("episode:Q", title="训练轮次（Episode）"),
-                    y=alt.Y("gdp:Q", title="1850年 GDP"),
-                    color=alt.Color("agent:N", legend=alt.Legend(title="智能体")),
-                )
-            )
-            smooth_line = (
-                alt.Chart(curve_df)
-                .mark_line(strokeWidth=2.5)
-                .encode(
-                    x="episode:Q",
-                    y=alt.Y("smooth:Q", title="1850年 GDP"),
-                    color=alt.Color("agent:N", legend=None),
-                    tooltip=["agent:N","episode:Q",
-                             alt.Tooltip("smooth:Q", title="平滑GDP", format=".2f")],
-                )
-            )
-            st.altair_chart(
-                (raw_line + smooth_line)
-                .properties(width="container", height=320,
-                            title="Q-Learning 训练曲线（实线=5轮移动平均）"),
-                use_container_width=True,
-            )
-
-        # ── 策略动作分布（水平条形图）────────────────────
-        st.subheader("RL 策略涌现行为：偏好哪种决策模式？")
-        st.caption("训练结束后，智能体在 Q-table 各状态上最偏好的动作分布。")
-
-        if strat_summary:
-            dist_rows = []
-            for civ_name, info in strat_summary.items():
-                for action, freq in info["action_distribution"].items():
-                    dist_rows.append({
-                        "agent":   civ_name,
-                        "reward":  info["reward_type"],
-                        "action":  action,
-                        "freq":    freq,
-                    })
-            dist_df = pd.DataFrame(dist_rows)
-
-            dist_chart = (
-                alt.Chart(dist_df)
-                .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
-                .encode(
-                    y=alt.Y("action:N",  title="策略模式", sort="-x"),
-                    x=alt.X("freq:Q",    title="偏好频率", axis=alt.Axis(format=".0%")),
-                    color=alt.Color("agent:N", legend=alt.Legend(title="智能体")),
-                    row=alt.Row("agent:N", title=""),
-                    tooltip=["agent:N","reward:N","action:N",
-                             alt.Tooltip("freq:Q", format=".1%")],
-                )
-                .properties(width="container", height=120,
-                            title="RL 智能体策略偏好分布")
-            )
-            st.altair_chart(dist_chart, use_container_width=True)
-
-            # 对照表
-            st.subheader("RL 策略 vs. 历史原型：验证假说")
-            expected_map = {
-                "power": ("航海扩张", "葡萄牙/西班牙（MaritimeExpansionist）"),
-                "gdp":   ("工业发展", "英国（IndustrialPioneer）"),
-                "trade": ("商业贸易", "荷兰（TradeHub）"),
-            }
-            match_rows = []
-            for civ_name, info in strat_summary.items():
-                d = info["action_distribution"]
-                top = max(d, key=d.get)
-                rt  = info["reward_type"]
-                exp_action, exp_hist = expected_map.get(rt, ("N/A","N/A"))
-                match_rows.append({
-                    "RL智能体": civ_name, "奖励函数": rt,
-                    "实际最常选": top, "预期对应": exp_action,
-                    "历史原型": exp_hist,
-                    "Q-table大小": info["q_table_size"],
-                    "假说吻合": "✅" if top == exp_action else "❓",
+        # 整合终局数据
+        comparison_rows = []
+        for m_name, m_df in all_results.items():
+            final_m = m_df[m_df["year"] == m_df["year"].max()]
+            for _, row in final_m.iterrows():
+                arch = row["civilization"].split("·")[0]
+                comparison_rows.append({
+                    "Mode": m_name,
+                    "Nation": row["civilization"],
+                    "原型": arch,
+                    "GDP": round(row["gdp"], 2),
+                    "人均GDP": round(row["gdp_per_capita"], 4),
+                    "技术综合": round(row["tech_composite"], 3),
+                    "领土": round(row["territories"], 2),
+                    "贸易收益": round(row["trade_income"], 3),
                 })
-            st.dataframe(pd.DataFrame(match_rows), use_container_width=True)
+        comp_df = pd.DataFrame(comparison_rows)
 
-        # ── RL vs 规则式 GDP 对比 ─────────────────────────
-        st.subheader("RL 策略 vs 规则式策略：GDP 轨迹对比")
-        rl_target_civs = ["西北欧（荷英）","伊比利亚（葡西）","奥斯曼帝国"]
+        # 各模式冠军
+        st.subheader("各模式终局冠军")
+        champ_rows = []
+        for m_name, m_df in all_results.items():
+            final_m = m_df[m_df["year"] == m_df["year"].max()]
+            champ = final_m.nlargest(1, "gdp").iloc[0]
+            power = final_m.copy()
+            power["power"] = power["gdp"] * power["military_str"] * np.sqrt(power["territories"])
+            power_champ = power.nlargest(1, "power").iloc[0]
+            champ_rows.append({
+                "Mode": m_name,
+                "GDP #1": champ["civilization"],
+                "GDP": round(champ["gdp"], 2),
+                "Power #1": power_champ["civilization"],
+            })
+        st.dataframe(pd.DataFrame(champ_rows), use_container_width=True)
 
-        compare_rows = []
-        for civ in rl_target_civs:
-            d_rl   = rl_df[rl_df["civilization"] == civ].copy()
-            d_rl["type"] = "RL 策略"
-            d_rule = df[df["civilization"] == civ].copy()
-            d_rule["type"] = "规则式策略"
-            compare_rows.extend([d_rl, d_rule])
-        cmp_df = pd.concat(compare_rows, ignore_index=True)
+        st.markdown("---")
 
-        cmp_chart = (
-            alt.Chart(cmp_df)
-            .mark_line(strokeWidth=2.2)
+        gdp_chart = (
+            alt.Chart(comp_df)
+            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
             .encode(
-                x=alt.X("year:Q", title="年份"),
-                y=alt.Y("gdp:Q",  title="GDP"),
-                color=alt.Color("civilization:N",
-                    scale=alt.Scale(domain=list(COLOR_MAP.keys()),
-                                    range=list(COLOR_MAP.values())),
-                    legend=alt.Legend(title="文明"),
-                ),
-                strokeDash=alt.StrokeDash(
-                    "type:N",
-                    scale=alt.Scale(domain=["RL 策略","规则式策略"], range=[[1,0],[6,3]]),
-                    legend=alt.Legend(title="策略类型"),
-                ),
-                tooltip=["civilization:N","type:N","year:Q","gdp:Q"],
+                x=alt.X("Mode:N"),
+                y=alt.Y("GDP:Q"),
+                color=alt.Color("原型:N", legend=alt.Legend(title="Nation", symbolOpacity=1)),
+                xOffset="Nation:N",
+                tooltip=["Mode:N", "Nation:N",
+                         alt.Tooltip("GDP:Q", format=".2f"),
+                         alt.Tooltip("人均GDP:Q", format=".4f")],
             )
-            .properties(width="container", height=380,
-                        title="RL 策略 vs 规则式策略：GDP 对比（实线=RL，虚线=规则式）")
-            .interactive()
+            .properties(width="container", height=320)
         )
-        st.altair_chart(alt.layer(era_bands(), cmp_chart), use_container_width=True)
+        st.altair_chart(gdp_chart, use_container_width=True)
 
-        st.info("""
-        📌 **解读**：如果 RL 策略（实线）优于规则式策略（虚线），
-        说明 ML 发现了人类历史决策者未能充分利用的"最优路径"；
-        如果低于，则说明规则式策略已经相当接近最优，
-        支持"历史并非随机漫步，而是某种隐性优化"的观点。
-        """)
+        st.markdown("---")
+
+        heatmap_df = comp_df.groupby(["原型", "Mode"])["GDP"].sum().reset_index()
+        heatmap_chart = (
+            alt.Chart(heatmap_df)
+            .mark_rect(stroke="white", strokeWidth=0.5)
+            .encode(
+                x=alt.X("Mode:N"),
+                y=alt.Y("原型:N", title="Nation"),
+                color=alt.Color("GDP:Q", scale=alt.Scale(scheme="orangered"),
+                                legend=alt.Legend(title="GDP", symbolOpacity=1)),
+                tooltip=["原型:N", "Mode:N", alt.Tooltip("GDP:Q", format=".2f")],
+            )
+            .properties(width="container", height=240)
+        )
+        text_hm = (
+            alt.Chart(heatmap_df)
+            .mark_text(fontSize=11, fontWeight="bold", color="white")
+            .encode(x="Mode:N", y="原型:N", text=alt.Text("GDP:Q", format=".1f"))
+        )
+        st.altair_chart((heatmap_chart + text_hm), use_container_width=True)
+
+        st.markdown("---")
+        st.dataframe(comp_df.sort_values(["Mode", "GDP"], ascending=[True, False]),
+                     use_container_width=True)
     else:
-        st.info("点击上方按钮开始训练 RL 智能体（约需 15-30 秒）。")
+        st.info("Run all 5 modes and compare (30-60s).")
 
-# ── 底部说明 ──────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+# Tab 7：ML 策略分析
+# ══════════════════════════════════════════════
+with tab7:
+    rl_agent_rows = [
+        {"Agent": CIVS[i] if i < len(CIVS) else "—", "Reward": r}
+        for i, r in enumerate(["max GDP", "max Power (GDP×mil×terr)", "max Trade"])
+    ]
+    st.dataframe(pd.DataFrame(rl_agent_rows), hide_index=True, use_container_width=False)
+
+    if st.button("Train RL agents", type="primary"):
+        with st.spinner(f"Training {rl_eps} episodes..."):
+            try:
+                rl_df, curves, _ = run_with_rl(mode_name, seed, rl_eps, overrides_json)
+                st.success("Done.")
+
+                # 训练曲线
+                st.subheader("Training Curve")
+                curve_rows = []
+                for civ_name, vals in curves.items():
+                    for ep, v in enumerate(vals):
+                        curve_rows.append({"episode": ep + 1, "gdp": v, "agent": civ_name})
+                curve_df = pd.DataFrame(curve_rows)
+
+                if not curve_df.empty:
+                    curve_df["smooth"] = (
+                        curve_df.groupby("agent")["gdp"]
+                        .transform(lambda x: x.rolling(5, min_periods=1).mean())
+                    )
+                    raw_line = (
+                        alt.Chart(curve_df)
+                        .mark_line(opacity=0.3, strokeWidth=1)
+                        .encode(
+                            x=alt.X("episode:Q", title="Episode"),
+                            y=alt.Y("gdp:Q",     title="Final GDP"),
+                            color=alt.Color("agent:N", legend=alt.Legend(title="Agent", symbolOpacity=1)),
+                        )
+                    )
+                    smooth_line = (
+                        alt.Chart(curve_df)
+                        .mark_line(strokeWidth=2.5)
+                        .encode(
+                            x="episode:Q",
+                            y=alt.Y("smooth:Q", title="Final GDP"),
+                            color=alt.Color("agent:N", legend=None),
+                            tooltip=["agent:N", "episode:Q",
+                                     alt.Tooltip("smooth:Q", title="GDP (5-ep avg)", format=".2f")],
+                        )
+                    )
+                    st.altair_chart(
+                        (raw_line + smooth_line)
+                        .properties(width="container", height=300,
+                                    title="Training curve (bold = 5-ep moving avg)"),
+                        use_container_width=True,
+                    )
+
+                st.subheader("RL vs Rule-based: GDP")
+                rl_target_civs = CIVS[:min(3, len(CIVS))]
+                compare_rows = []
+                for civ in rl_target_civs:
+                    d_rl = rl_df[rl_df["civilization"] == civ].copy()
+                    d_rl["类型"] = "RL 策略"
+                    d_rule = df[df["civilization"] == civ].copy()
+                    d_rule["类型"] = "规则式策略"
+                    compare_rows.extend([d_rl, d_rule])
+                cmp_df = pd.concat(compare_rows, ignore_index=True)
+
+                cmp_chart = (
+                    alt.Chart(cmp_df)
+                    .mark_line(strokeWidth=2.2)
+                    .encode(
+                        x=alt.X("year:Q", title="Year"),
+                        y=alt.Y("gdp:Q",  title="GDP"),
+                        color=alt.Color(
+                            "civilization:N",
+                            scale=alt.Scale(domain=list(COLOR_MAP.keys()),
+                                            range=list(COLOR_MAP.values())),
+                            legend=alt.Legend(title="Nation", symbolOpacity=1),
+                        ),
+                        strokeDash=alt.StrokeDash(
+                            "类型:N",
+                            scale=alt.Scale(
+                                domain=["RL 策略", "规则式策略"],
+                                range=[[1, 0], [6, 3]],
+                            ),
+                            legend=alt.Legend(title="策略类型", symbolOpacity=1),
+                        ),
+                        tooltip=["civilization:N", "类型:N", "year:Q", "gdp:Q"],
+                    )
+                    .properties(width="container", height=320,
+                                title="solid=RL, dashed=rule-based")
+                    .interactive()
+                )
+                st.altair_chart(
+                    alt.layer(era_bands(), cmp_chart), use_container_width=True
+                )
+
+                st.markdown("---")
+                st.subheader("Agent Decisions")
+                rl_agents = CIVS[:min(3, len(CIVS))]
+                rl_dec_df = rl_df[rl_df["civilization"].isin(rl_agents)].copy()
+
+                # 技术重点热力图
+                hm_tech = (
+                    alt.Chart(rl_dec_df)
+                    .mark_rect(stroke="white", strokeWidth=0.4)
+                    .encode(
+                        x=alt.X("year:O", title="Year",
+                                axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+                        y=alt.Y("civilization:N", title="Agent"),
+                        color=alt.Color(
+                            "decision_tech:N",
+                            scale=alt.Scale(
+                                domain=list(TECH_LABELS.keys()),
+                                range=list(TECH_COLORS.values()),
+                            ),
+                            legend=alt.Legend(title="Tech Focus", symbolOpacity=1,
+                                             labelExpr=(
+                                                 "datum.label == 'agriculture' ? '🌾 农业' : "
+                                                 "datum.label == 'navigation'  ? '⛵ 航海' : "
+                                                 "datum.label == 'military'    ? '⚔️ 军事' : "
+                                                 "datum.label == 'industry'    ? '🏭 工业' : '💰 商业'"
+                                             )),
+                        ),
+                        tooltip=["civilization:N", "year:Q", "decision_tech:N",
+                                 alt.Tooltip("gdp:Q", title="GDP", format=".2f")],
+                    )
+                    .properties(width="container", height=max(60, 30 * len(rl_agents)),
+                                title="技术投资方向（颜色=被强化的技术领域）")
+                )
+                st.altair_chart(hm_tech, use_container_width=True)
+
+                # 贸易政策热力图
+                TRADE_COLORS_MAP = {"open": "#2a9d8f", "balanced": "#e9c46a", "closed": "#e63946"}
+                hm_trade = (
+                    alt.Chart(rl_dec_df)
+                    .mark_rect(stroke="white", strokeWidth=0.4)
+                    .encode(
+                        x=alt.X("year:O", title="Year",
+                                axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+                        y=alt.Y("civilization:N", title="Agent"),
+                        color=alt.Color(
+                            "decision_trade:N",
+                            scale=alt.Scale(
+                                domain=list(TRADE_COLORS_MAP.keys()),
+                                range=list(TRADE_COLORS_MAP.values()),
+                            ),
+                            legend=alt.Legend(title="Trade Policy", symbolOpacity=1,
+                                             labelExpr=(
+                                                 "datum.label == 'open'   ? '开放' : "
+                                                 "datum.label == 'closed' ? '封闭' : '均衡'"
+                                             )),
+                        ),
+                        tooltip=["civilization:N", "year:Q", "decision_trade:N",
+                                 alt.Tooltip("trade_income:Q", title="Trade Income", format=".3f")],
+                    )
+                    .properties(width="container", height=max(60, 30 * len(rl_agents)),
+                                title="贸易政策选择（绿=开放 / 黄=均衡 / 红=封闭）")
+                )
+                st.altair_chart(hm_trade, use_container_width=True)
+
+                # 扩张等级热力图
+                EXPAND_COLORS_MAP = {0: "#264653", 1: "#e9c46a", 2: "#e76f51"}
+                hm_expand = (
+                    alt.Chart(rl_dec_df)
+                    .mark_rect(stroke="white", strokeWidth=0.4)
+                    .encode(
+                        x=alt.X("year:O", title="Year",
+                                axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+                        y=alt.Y("civilization:N", title="Agent"),
+                        color=alt.Color(
+                            "decision_expand:O",
+                            scale=alt.Scale(
+                                domain=[0, 1, 2],
+                                range=["#264653", "#e9c46a", "#e76f51"],
+                            ),
+                            legend=alt.Legend(title="Expand", symbolOpacity=1,
+                                             labelExpr=(
+                                                 "datum.label == '0' ? '保守' : "
+                                                 "datum.label == '1' ? '温和' : '激进'"
+                                             )),
+                        ),
+                        tooltip=["civilization:N", "year:Q", "decision_expand:O",
+                                 alt.Tooltip("territories:Q", title="领土", format=".2f")],
+                    )
+                    .properties(width="container", height=max(60, 30 * len(rl_agents)),
+                                title="Expansion (dark=conservative / yellow=moderate / orange=aggressive)")
+                )
+                st.altair_chart(hm_expand, use_container_width=True)
+
+                st.markdown("---")
+                st.subheader("Action Frequency")
+                freq_rows = []
+                for agent in rl_agents:
+                    d = rl_df[rl_df["civilization"] == agent]
+                    for tech_val, cnt in d["decision_tech"].value_counts().items():
+                        freq_rows.append({
+                            "Agent": agent, "Dim": "Tech",
+                            "Choice": TECH_LABELS.get(tech_val, tech_val), "Count": int(cnt),
+                        })
+                    for trade_val, cnt in d["decision_trade"].value_counts().items():
+                        freq_rows.append({
+                            "Agent": agent, "Dim": "Trade",
+                            "Choice": TRADE_LABELS.get(trade_val, str(trade_val)), "Count": int(cnt),
+                        })
+                    for exp_val, cnt in d["decision_expand"].value_counts().items():
+                        freq_rows.append({
+                            "Agent": agent, "Dim": "Expand",
+                            "Choice": EXPAND_LABELS.get(int(exp_val), str(exp_val)), "Count": int(cnt),
+                        })
+                if freq_rows:
+                    freq_df = pd.DataFrame(freq_rows)
+                    freq_chart = (
+                        alt.Chart(freq_df)
+                        .mark_bar(cornerRadiusTopRight=3, cornerRadiusBottomRight=3)
+                        .encode(
+                            x=alt.X("Count:Q"),
+                            y=alt.Y("Choice:N", sort="-x"),
+                            color=alt.Color(
+                                "Agent:N",
+                                scale=alt.Scale(domain=list(COLOR_MAP.keys()),
+                                               range=list(COLOR_MAP.values())),
+                                legend=alt.Legend(title="Agent", symbolOpacity=1),
+                            ),
+                            row=alt.Row("Dim:N", header=alt.Header(labelFontSize=12)),
+                            tooltip=["Agent:N", "Dim:N", "Choice:N", "Count:Q"],
+                        )
+                        .properties(width=420, height=100)
+                        .resolve_scale(y="independent")
+                    )
+                    st.altair_chart(freq_chart, use_container_width=False)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+    else:
+        st.info("Train RL agents (~15-40s).")
+
 st.markdown("---")
-st.caption("""
-**模型说明** | 课程：ECON0302G 世界经济导论 | 图表引擎：Vega-Altair
-
-经济模型：Cobb-Douglas 生产函数（Y = A·L^α·K^β·T^γ） + 比较优势贸易 + Logistic 人口动态
-ML 方法：表格型 Q-Learning（Bellman 方程更新），状态空间 4096 维，动作空间 5 维
-历史校准参考：麦迪森世界经济历史统计数据库（Maddison Project Database 2020）
-反事实实验：修改地理/策略参数，排除随机事件，推演替代历史路径
-""")
+st.caption("ECON0302G | Cobb-Douglas + Q-Learning | Vega-Altair")

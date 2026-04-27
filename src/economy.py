@@ -14,11 +14,6 @@ economy.py
   - 贸易收益：基于比较优势 + 贸易开放度 + 网络效应
   - 殖民收益：航海技术 × 军事实力 × 殖民地规模
   - 技术扩散：贸易越密切，越容易学习对方技术
-
-历史校准目标（来自麦迪森数据库）：
-  - 1000 AD：中国 GDP ~全球 22%，西欧 ~9%
-  - 1820 AD：英国人均 GDP ~1700 年的 4 倍
-  - 工业革命造成"大分流"：英国 vs 中国差距在 1800-1850 年急剧扩大
 """
 
 import numpy as np
@@ -110,10 +105,6 @@ def update_population(civ: Civilization, era: Era) -> float:
 
     K（承载上限）由农业技术和粮食资源决定，
     体现"农业技术提升 → 养活更多人口 → 更大劳动力 → 更高 GDP"的历史逻辑。
-
-    历史数据校准：
-      中世纪年增长率约 0.1-0.2%，即每回合（20年）~2-4%
-      工业革命后可达 0.8-1.2%/年
     """
     # 基础增长率（每回合，非年化）
     base_rate = 0.04 if era == Era.MEDIEVAL else 0.06
@@ -376,6 +367,15 @@ def apply_turn(
     savings_rate    = decision.get("savings_rate", BASE_SAVINGS)
     tech_inv_share  = decision.get("tech_investment", 0.08)
 
+    # Trade-policy cost: open trade crowds out domestic capital formation;
+    # closed policy protects it at the cost of lower trade income and diffusion.
+    # Multipliers are applied here so they hold regardless of strategy type.
+    SAVINGS_MODIFIER = {"open": 0.88, "balanced": 1.00, "closed": 1.10}
+    savings_rate *= SAVINGS_MODIFIER[trade_policy]
+
+    # open also amplifies external price shocks (imported volatility)
+    SHOCK_MODIFIER = {"open": 1.40, "balanced": 1.00, "closed": 0.75}
+
     # 1. 领土扩张
     civ.territories = update_territories(civ, era, expansion_level)
 
@@ -396,13 +396,14 @@ def apply_turn(
     base_gdp = compute_gdp(civ, era)
     civ.gdp  = base_gdp + civ.trade_income + civ.colonial_income
 
-    # 随机扰动：模拟历史中的偶然因素（战争、疫情、发明）
-    shock = 1.0 + rng.normal(0, noise_std)
+    # 随机扰动（开放经济对外部冲击更敏感）
+    effective_noise = noise_std * SHOCK_MODIFIER[trade_policy]
+    shock = 1.0 + rng.normal(0, effective_noise)
     civ.gdp = max(civ.gdp * shock, 0.01)
 
     # 7. 更新贸易开放度（向目标值缓慢调整，不能突变）
     target_openness = {"open": 0.85, "balanced": 0.50, "closed": 0.15}[trade_policy]
-    civ.trade_openness += 0.15 * (target_openness - civ.trade_openness)  # 渐进收敛
+    civ.trade_openness += 0.15 * (target_openness - civ.trade_openness)
 
     # 军事实力 = 军事技术 × 经济规模（相对化）
     civ.military_str = civ.technology.military * (1.0 + 0.1 * (civ.gdp / 5.0))

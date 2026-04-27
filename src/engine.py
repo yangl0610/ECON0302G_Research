@@ -24,145 +24,7 @@ from .civilization import Civilization, Era, TURNS_PER_ERA, ERA_YEARS
 from .economy import apply_turn
 from .strategies import BaseStrategy, QLearningStrategy
 from .events import EventSystem
-
-
-# ─────────────────────────────────────────────
-# 预设文明配置（历史上的 8 个主要文明/地区）
-# ─────────────────────────────────────────────
-from .civilization import Geography, Resources
-
-def build_default_civs() -> List[Civilization]:
-    """
-    返回 8 个历史文明的初始配置。
-    地理参数和资源参数基于历史研究粗略校准：
-      - 中国：高地理质量、高粮食，但低煤炭（大部分煤炭在内陆）
-      - 西欧：高海岸、战略位置优越，工业时代前中期
-      - 奥斯曼：战略位置极高（控制东西贸易要道）
-      - 印度：高农业、高奢侈品（香料、棉布）
-      - 葡/西（伊比利亚）：极高海岸，优先航海
-      - 荷/英（西北欧）：高贸易战略位置，有煤炭
-      - 非洲（撒哈拉以南）：高奢侈品（黄金）但低航海
-      - 美洲（阿兹特克/印加）：高金属（白银），与外界隔绝
-
-    纬度/经度仅用于世界地图可视化。
-    """
-    from .civilization import Geography, Resources
-
-    return [
-        Civilization(
-            name="中华帝国",
-            geography=Geography(
-                coast_access=0.45,       # 有东南沿海，但海禁政策
-                terrain_quality=0.85,    # 黄河/长江流域，极优农业
-                climate_score=0.75,
-                river_density=0.80,      # 大运河体系
-                strategic_location=0.55, # 丝绸之路东端，但非核心节点
-            ),
-            resources=Resources(food=2.5, metal=1.5, wood=1.2, luxury=1.8, coal=0.8),
-            strategy_name="AgrarianConservative",
-            color="#e63946",
-            lat=35.0, lon=105.0,
-        ),
-        Civilization(
-            name="西欧诸国",
-            geography=Geography(
-                coast_access=0.70,
-                terrain_quality=0.65,
-                climate_score=0.60,
-                river_density=0.65,
-                strategic_location=0.60,
-            ),
-            resources=Resources(food=1.8, metal=1.6, wood=1.5, luxury=0.8, coal=1.2),
-            strategy_name="Mercantilist",
-            color="#457b9d",
-            lat=48.0, lon=8.0,
-        ),
-        Civilization(
-            name="伊比利亚（葡西）",
-            geography=Geography(
-                coast_access=0.90,       # 大西洋+地中海双面海岸
-                terrain_quality=0.50,
-                climate_score=0.65,
-                river_density=0.40,
-                strategic_location=0.70, # 连接地中海和大西洋
-            ),
-            resources=Resources(food=1.2, metal=1.0, wood=1.3, luxury=0.6, coal=0.3),
-            strategy_name="MaritimeExpansionist",
-            color="#f4a261",
-            lat=40.0, lon=-5.0,
-        ),
-        Civilization(
-            name="西北欧（荷英）",
-            geography=Geography(
-                coast_access=0.85,
-                terrain_quality=0.55,
-                climate_score=0.55,
-                river_density=0.75,      # 莱茵河、泰晤士河
-                strategic_location=0.80, # 北海贸易中心
-            ),
-            resources=Resources(food=1.4, metal=1.3, wood=1.2, luxury=0.5, coal=1.8),  # 英国煤矿
-            strategy_name="TradeHub",
-            color="#2a9d8f",
-            lat=52.0, lon=4.0,
-        ),
-        Civilization(
-            name="奥斯曼帝国",
-            geography=Geography(
-                coast_access=0.65,
-                terrain_quality=0.60,
-                climate_score=0.65,
-                river_density=0.55,
-                strategic_location=0.95, # 控制欧亚贸易要道（博斯普鲁斯海峡）
-            ),
-            resources=Resources(food=1.5, metal=1.2, wood=0.9, luxury=1.4, coal=0.4),
-            strategy_name="Mercantilist",
-            color="#e9c46a",
-            lat=39.0, lon=35.0,
-        ),
-        Civilization(
-            name="印度次大陆",
-            geography=Geography(
-                coast_access=0.60,
-                terrain_quality=0.80,    # 恒河平原
-                climate_score=0.70,
-                river_density=0.70,
-                strategic_location=0.65, # 印度洋贸易中心
-            ),
-            resources=Resources(food=2.2, metal=1.0, wood=1.4, luxury=2.0, coal=0.6),
-            strategy_name="AgrarianConservative",
-            color="#a8dadc",
-            lat=22.0, lon=80.0,
-        ),
-        Civilization(
-            name="撒哈拉以南非洲",
-            geography=Geography(
-                coast_access=0.35,
-                terrain_quality=0.60,
-                climate_score=0.50,
-                river_density=0.55,
-                strategic_location=0.30,
-            ),
-            resources=Resources(food=1.8, metal=0.8, wood=1.5, luxury=1.5, coal=0.2),
-            strategy_name="AgrarianConservative",
-            color="#6d4c41",
-            lat=2.0, lon=22.0,
-        ),
-        Civilization(
-            name="美洲文明",
-            geography=Geography(
-                coast_access=0.50,
-                terrain_quality=0.70,
-                climate_score=0.65,
-                river_density=0.60,
-                strategic_location=0.10, # 与旧大陆隔绝，大发现后急剧变化
-            ),
-            resources=Resources(food=2.0, metal=0.7, wood=1.8, luxury=0.8, coal=0.4),
-            strategy_name="AgrarianConservative",
-            color="#9c6644",
-            lat=15.0, lon=-85.0,
-        ),
-    ]
-
+from .archetypes import build_competition_civs
 
 # ─────────────────────────────────────────────
 # 模拟引擎主体
@@ -190,7 +52,7 @@ class SimulationEngine:
         seed: int = 42,
         training_mode: bool = False,
     ):
-        self.civs           = civs if civs is not None else build_default_civs()
+        self.civs           = civs if civs is not None else build_competition_civs("五强争霸")
         self.strategy_map   = strategy_map or {}
         self.events_enabled = events_enabled
         self.noise_std      = noise_std
@@ -281,9 +143,9 @@ class SimulationEngine:
                     state_vec = civ.state_vector(world_avg_gdp, era)
                     strategy.update(civ, state_vec, era)
 
-        # 4. 记录所有文明的当前状态
+        # 4. 记录所有文明的当前状态（含本回合决策）
         for civ in self.civs:
-            civ.record(year, era)
+            civ.record(year, era, decisions_this_turn.get(civ.name))
 
         # 5. 汇总本回合日志
         turn_record = {
@@ -408,11 +270,14 @@ class SimulationEngine:
                     "territories":    h["territories"][i],
                     "trade_openness": h["trade_openness"][i],
                     "military_str":   h["military_str"][i],
-                    "tech_agri":      h["tech_agri"][i],
-                    "tech_nav":       h["tech_nav"][i],
-                    "tech_mil":       h["tech_mil"][i],
-                    "tech_ind":       h["tech_ind"][i],
-                    "tech_com":       h["tech_com"][i],
+                    "tech_agri":       h["tech_agri"][i],
+                    "tech_nav":        h["tech_nav"][i],
+                    "tech_mil":        h["tech_mil"][i],
+                    "tech_ind":        h["tech_ind"][i],
+                    "tech_com":        h["tech_com"][i],
+                    "decision_tech":   h["decision_tech"][i],
+                    "decision_expand": h["decision_expand"][i],
+                    "decision_trade":  h["decision_trade"][i],
                 })
         return pd.DataFrame(rows)
 

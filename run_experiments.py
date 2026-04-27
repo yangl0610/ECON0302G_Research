@@ -1,15 +1,13 @@
 """
 run_experiments.py
 ------------------
-命令行实验运行器。无需打开 Streamlit，直接在终端运行，
-输出文字报告和保存图表 PNG。
+Per-turn analysis and RL comparison for a given competition mode.
 
-用法：
-    python run_experiments.py                    # 跑所有实验
-    python run_experiments.py --seed 42          # 指定随机种子
-    python run_experiments.py --no-events        # 关闭随机事件
-    python run_experiments.py --train-rl 80      # 训练 RL 80 轮
-    python run_experiments.py --monte-carlo 20   # 蒙特卡洛 20 次模拟
+Usage:
+    python run_experiments.py                            # 5-Nation, seed=42, 60 RL episodes
+    python run_experiments.py --mode 1v1
+    python run_experiments.py --mode 3-Nation --seed 7 --rl-episodes 80
+    python run_experiments.py --no-events --rl-episodes 0   # rule-based only
 """
 
 import argparse
@@ -18,339 +16,397 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # 非交互式后端，可以保存图片
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from copy import deepcopy
 
 sys.path.insert(0, os.path.dirname(__file__))
-from src.engine import SimulationEngine, build_default_civs
-from src.strategies import make_strategy
+from src.engine import SimulationEngine
+from src.archetypes import build_competition_civs, COMPETITION_MODES
+from src.strategies import make_strategy, QLearningStrategy
 
-
-# ─────────────────────────────────────────────
-# 输出目录
-# ─────────────────────────────────────────────
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ── Display shorthands ────────────────────────────────────────────────────
+TECH_SHORT   = {"agriculture": "Agri", "navigation": "Nav", "military": "Mil",
+                "industry": "Ind",  "commerce":  "Com"}
+TRADE_SHORT  = {"open": "Open", "balanced": "Bal", "closed": "Cls"}
+EXPAND_SHORT = {0: "Stay", 1: "Mod", 2: "Agg"}
+TECH_ORDER   = ["agriculture", "navigation", "military", "industry", "commerce"]
+TECH_IDX     = {t: i for i, t in enumerate(TECH_ORDER)}
+TRADE_ORDER  = {"open": 0, "balanced": 1, "closed": 2}
+ERA_BANDS    = [(1000, 1400, "#8ecae6"), (1400, 1600, "#ffb703"),
+                (1600, 1750, "#fb8500"), (1750, 1860, "#8338ec")]
+PALETTE      = ["#e63946", "#457b9d", "#f4a261", "#2a9d8f", "#9c6644"]
 
-# ─────────────────────────────────────────────
-# 实验 1：历史基准线
-# ─────────────────────────────────────────────
-def experiment_baseline(seed: int, events: bool) -> pd.DataFrame:
-    """
-    跑一次历史基准模拟（使用默认 8 个文明和各自的规则式策略）。
-    输出：各文明 GDP、人均 GDP、技术水平的摘要表。
-    """
-    print("\n" + "="*60)
-    print("实验 1：历史基准线模拟")
-    print(f"  随机种子={seed}，随机事件={'开启' if events else '关闭'}")
-    print("="*60)
 
-    engine = SimulationEngine(events_enabled=events, seed=seed)
+# ─────────────────────────────────────────────────────────────────────────
+# Simulation runners
+# ─────────────────────────────────────────────────────────────────────────
+
+def run_rule_based(mode: str, seed: int, events: bool) -> pd.DataFrame:
+    civs = build_competition_civs(mode)
+    engine = SimulationEngine(civs=civs, events_enabled=events, seed=seed)
     engine.run()
-    df = engine.get_history_df()
-
-    # 打印 1000 AD 和 1850 AD 的快照
-    for year in [1000, 1400, 1600, 1750, 1850]:
-        snap = df[df["year"] == year][["civilization", "gdp", "gdp_per_capita", "tech_composite", "territories"]]
-        snap = snap.sort_values("gdp", ascending=False)
-        print(f"\n  ─── {year} AD ───")
-        print(snap.to_string(index=False))
-
-    # 保存静态折线图
-    _save_gdp_chart(df, "baseline_gdp.png", title="历史基准线：GDP 演变（1000-1850）")
-
-    # 打印 1850 年 GDP 增长倍数
-    print("\n  ─── 1850年 GDP 相对 1000年的增长倍数 ───")
-    gdp_1000 = df[df["year"] == df["year"].min()].set_index("civilization")["gdp"]
-    gdp_1850 = df[df["year"] == df["year"].max()].set_index("civilization")["gdp"]
-    for civ in gdp_1850.index:
-        if civ in gdp_1000.index and gdp_1000[civ] > 0:
-            ratio = gdp_1850[civ] / gdp_1000[civ]
-            print(f"    {civ:<20} {ratio:.1f}x")
-
-    return df
+    return engine.get_history_df()
 
 
-# ─────────────────────────────────────────────
-# 实验 2：策略互换（反事实）
-# ─────────────────────────────────────────────
-def experiment_strategy_swap(seed: int) -> None:
-    """
-    给中华帝国换上不同的策略，其他文明不变，
-    观察其 GDP 轨迹的变化，评估策略选择对历史路径的影响力。
-    """
-    print("\n" + "="*60)
-    print("实验 2：策略反事实——改变中华帝国的策略")
-    print("="*60)
-
-    strategies_to_test = [
-        ("AgrarianConservative（历史实际）",  "AgrarianConservative"),
-        ("MaritimeExpansionist（航海扩张）",  "MaritimeExpansionist"),
-        ("IndustrialPioneer（工业先行）",      "IndustrialPioneer"),
-        ("TradeHub（贸易枢纽）",               "TradeHub"),
-    ]
-
-    results = {}
-    for label, strat_name in strategies_to_test:
-        civs = build_default_civs()
-        strat_map = {}
-        for c in civs:
-            if c.name == "中华帝国":
-                strat_map[c.name] = make_strategy(strat_name)
-            else:
-                strat_map[c.name] = make_strategy(c.strategy_name)
-
-        engine = SimulationEngine(civs=civs, strategy_map=strat_map, events_enabled=False, seed=seed)
-        engine.run()
-        df = engine.get_history_df()
-        results[label] = df[df["civilization"] == "中华帝国"]
-
-    # 打印 1850 年终值
-    print("\n  中华帝国 1850年 GDP 对比：")
-    for label, d in results.items():
-        final = d[d["year"] == d["year"].max()]
-        if not final.empty:
-            print(f"    {label:<40} GDP={final['gdp'].values[0]:.2f}  "
-                  f"人均GDP={final['gdp_per_capita'].values[0]:.4f}  "
-                  f"工业技术={final['tech_ind'].values[0]:.2f}")
-
-    # 保存对比图
-    fig, ax = plt.subplots(figsize=(10, 5))
-    colors = ["#e63946", "#2a9d8f", "#457b9d", "#f4a261"]
-    for (label, d), color in zip(results.items(), colors):
-        ax.plot(d["year"], d["gdp"], label=label, color=color, linewidth=2)
-
-    # 添加时代背景色
-    ax.axvspan(1000, 1400, alpha=0.05, color="blue",   label="_中世纪")
-    ax.axvspan(1400, 1600, alpha=0.05, color="orange", label="_大航海")
-    ax.axvspan(1600, 1750, alpha=0.05, color="red",    label="_重商主义")
-    ax.axvspan(1750, 1850, alpha=0.05, color="purple", label="_工业革命")
-
-    ax.set_xlabel("年份")
-    ax.set_ylabel("GDP（相对单位）")
-    ax.set_title("策略反事实：不同策略下中华帝国的 GDP 轨迹")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "counterfactual_china_strategy.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"\n  图表已保存：{save_path}")
-
-
-# ─────────────────────────────────────────────
-# 实验 3：地理反事实
-# ─────────────────────────────────────────────
-def experiment_geography_swap(seed: int) -> None:
-    """
-    改变西北欧（荷英）的煤炭资源，研究工业革命是否必然发生在此。
-    核心问题：如果英国没有煤炭，工业革命会在哪里发生？
-    """
-    print("\n" + "="*60)
-    print("实验 3：地理反事实——煤炭对工业革命的影响")
-    print("="*60)
-
-    scenarios = {
-        "历史实际（高煤炭：1.8）": 1.8,
-        "中等煤炭（1.0）":          1.0,
-        "低煤炭（0.3）":             0.3,
-        "无煤炭（0.0）":             0.0,
-    }
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    colors = ["#2a9d8f", "#457b9d", "#e9c46a", "#e63946"]
-
-    for (label, coal_val), color in zip(scenarios.items(), colors):
-        civs = build_default_civs()
-        for c in civs:
-            if c.name == "西北欧（荷英）":
-                c.resources.coal = coal_val
-        engine = SimulationEngine(civs=civs, events_enabled=False, seed=seed)
-        engine.run()
-        df = engine.get_history_df()
-
-        d = df[df["civilization"] == "西北欧（荷英）"]
-        axes[0].plot(d["year"], d["gdp"], label=label, color=color, linewidth=2)
-        axes[1].plot(d["year"], d["tech_ind"], label=label, color=color, linewidth=2)
-
-        final = d[d["year"] == d["year"].max()]
-        print(f"  {label:<35} "
-              f"GDP={final['gdp'].values[0]:.2f}  "
-              f"工业技术={final['tech_ind'].values[0]:.2f}")
-
-    for ax, ylabel, title in zip(
-        axes,
-        ["GDP（相对单位）", "工业技术水平（0-10）"],
-        ["GDP 轨迹", "工业技术发展"]
-    ):
-        ax.set_xlabel("年份")
-        ax.set_ylabel(ylabel)
-        ax.set_title(f"西北欧（荷英）— {title}")
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
-        ax.axvspan(1750, 1850, alpha=0.08, color="purple")
-
-    plt.suptitle("地理反事实：煤炭资源对工业革命的影响", fontsize=13)
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "counterfactual_coal.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"\n  图表已保存：{save_path}")
-
-
-# ─────────────────────────────────────────────
-# 实验 4：蒙特卡洛——评估历史偶然性
-# ─────────────────────────────────────────────
-def experiment_monte_carlo(n_runs: int = 20) -> None:
-    """
-    运行 N 次完全相同参数的模拟（只改变随机种子），
-    观察 1850 年 GDP 排名的方差，
-    从而定量评估"历史偶然性"对结局的影响程度。
-
-    如果每次排名完全相同 → 结果高度决定论（地理/策略决定一切）
-    如果排名高度随机     → 历史偶然性占主导
-    """
-    print("\n" + "="*60)
-    print(f"实验 4：蒙特卡洛模拟（N={n_runs}）——评估历史偶然性")
-    print("="*60)
-
-    all_results = []
-    for i in range(n_runs):
-        engine = SimulationEngine(events_enabled=True, seed=i, noise_std=0.03)
-        engine.run()
-        df = engine.get_history_df()
-        final = df[df["year"] == df["year"].max()][["civilization", "gdp", "gdp_per_capita"]]
-        final["run"] = i
-        all_results.append(final)
-
-    all_df = pd.concat(all_results, ignore_index=True)
-
-    # 计算各文明 GDP 的均值和标准差
-    stats = all_df.groupby("civilization")["gdp"].agg(["mean", "std", "min", "max"])
-    stats["cv"] = (stats["std"] / stats["mean"] * 100).round(1)  # 变异系数（%）
-    stats = stats.sort_values("mean", ascending=False)
-
-    print("\n  1850年 GDP 统计（N 次模拟）：")
-    print(f"  {'文明':<20} {'均值':>8} {'标准差':>8} {'最小':>8} {'最大':>8} {'变异系数%':>10}")
-    for civ, row in stats.iterrows():
-        print(f"  {civ:<20} {row['mean']:>8.2f} {row['std']:>8.2f} "
-              f"{row['min']:>8.2f} {row['max']:>8.2f} {row['cv']:>9.1f}%")
-
-    # 计算每次模拟中 GDP 排名第一的文明
-    rank1_counts = all_df.loc[all_df.groupby("run")["gdp"].idxmax(), "civilization"].value_counts()
-    print("\n  N 次模拟中 GDP 第一的文明频次：")
-    for civ, count in rank1_counts.items():
-        print(f"    {civ:<25} {count}/{n_runs} 次 ({100*count/n_runs:.0f}%)")
-
-    # 绘制箱线图
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    civs_ordered = stats.index.tolist()
-    data_for_box = [all_df[all_df["civilization"] == c]["gdp"].values for c in civs_ordered]
-
-    ax1.boxplot(data_for_box, labels=[c.replace("（", "\n（") for c in civs_ordered], vert=True)
-    ax1.set_ylabel("1850年 GDP")
-    ax1.set_title(f"GDP 分布（N={n_runs} 次模拟）")
-    ax1.tick_params(axis='x', labelsize=8)
-    ax1.grid(axis='y', alpha=0.3)
-
-    # 变异系数条形图（越高 = 历史偶然性越大）
-    ax2.barh(civs_ordered, stats["cv"], color="#457b9d", alpha=0.8)
-    ax2.set_xlabel("变异系数 CV（%）")
-    ax2.set_title("历史偶然性敏感度\n（变异系数越高 = 结果越不确定）")
-    ax2.grid(axis='x', alpha=0.3)
-    ax2.axvline(stats["cv"].mean(), color="red", linestyle="--", label=f"均值 {stats['cv'].mean():.1f}%")
-    ax2.legend()
-
-    plt.suptitle(f"蒙特卡洛分析：历史偶然性对 1850 年格局的影响（N={n_runs}）", fontsize=12)
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "monte_carlo.png")
-    plt.savefig(save_path, dpi=150)
-    plt.close()
-    print(f"\n  图表已保存：{save_path}")
-
-    # 总结
-    avg_cv = stats["cv"].mean()
-    print(f"\n  结论：平均变异系数 = {avg_cv:.1f}%")
-    if avg_cv < 10:
-        print("  → 历史结果高度稳定，地理/策略是主要决定因素（强决定论）")
-    elif avg_cv < 25:
-        print("  → 历史结果中等稳定，偶然性有影响但非决定性")
-    else:
-        print("  → 历史结果高度不确定，偶然性起重要作用")
-
-
-# ─────────────────────────────────────────────
-# 辅助：保存 GDP 折线图
-# ─────────────────────────────────────────────
-def _save_gdp_chart(df: pd.DataFrame, filename: str, title: str) -> None:
-    colors = ["#e63946", "#457b9d", "#f4a261", "#2a9d8f",
-              "#e9c46a", "#a8dadc", "#6d4c41", "#9c6644"]
-    civs = df["civilization"].unique()
-
-    fig, ax = plt.subplots(figsize=(12, 6))
+def run_rl(mode: str, seed: int, episodes: int):
+    """Train RL agents, then run one final simulation. Returns (df, curves, engine)."""
+    civs = build_competition_civs(mode)
+    rl_reward_types = ["RL_gdp", "RL_power", "RL_trade"]
+    strategy_map = {}
     for i, civ in enumerate(civs):
-        d = df[df["civilization"] == civ]
-        ax.plot(d["year"], d["gdp"], label=civ, color=colors[i % len(colors)], linewidth=1.8)
+        strategy_map[civ.name] = (
+            make_strategy(rl_reward_types[i]) if i < len(rl_reward_types)
+            else make_strategy(civ.strategy_name)
+        )
+    engine = SimulationEngine(
+        civs=civs, strategy_map=strategy_map,
+        events_enabled=True, seed=seed, training_mode=True,
+    )
+    curves = engine.train_rl_agents(n_episodes=episodes)
+    engine.run()
+    return engine.get_history_df(), curves, engine
 
-    ax.axvspan(1000, 1400, alpha=0.05, color="blue")
-    ax.axvspan(1400, 1600, alpha=0.05, color="orange")
-    ax.axvspan(1600, 1750, alpha=0.05, color="red")
-    ax.axvspan(1750, 1850, alpha=0.07, color="purple")
 
-    for x, label in [(1000, "中世纪"), (1400, "大航海"), (1600, "重商主义"), (1750, "工业革命")]:
-        ax.axvline(x, color="gray", linestyle=":", linewidth=0.8, alpha=0.5)
-        ax.text(x + 5, ax.get_ylim()[1] * 0.95, label, fontsize=8, color="gray", alpha=0.7)
+# ─────────────────────────────────────────────────────────────────────────
+# Text output helpers
+# ─────────────────────────────────────────────────────────────────────────
 
-    ax.set_xlabel("年份")
-    ax.set_ylabel("GDP（相对单位）")
-    ax.set_title(title)
-    ax.legend(fontsize=8, loc="upper left")
-    ax.grid(alpha=0.25)
-    plt.tight_layout()
+def _sep(n=68): return "─" * n
 
-    save_path = os.path.join(OUTPUT_DIR, filename)
-    plt.savefig(save_path, dpi=150)
+
+def print_turn_table(df: pd.DataFrame, mode: str) -> None:
+    """Print per-turn GDP and tech_composite for all nations."""
+    civs  = sorted(df["civilization"].unique())
+    years = sorted(df["year"].unique())
+    col_w = 10
+
+    header = f"{'Year':<6}" + "".join(f"  {c:>{col_w}}" for c in civs)
+
+    print(f"\n{'═'*68}")
+    print(f"Mode: {mode}  —  per-turn snapshots")
+    print('═'*68)
+
+    for metric, label in [("gdp", "GDP"), ("tech_composite", "Tech")]:
+        print(f"\n  {label}:")
+        print(f"  {header}")
+        print(f"  {_sep(6 + (col_w + 2) * len(civs))}")
+        for y in years:
+            snap = df[df["year"] == y]
+            row  = f"  {y:<6}"
+            for civ in civs:
+                r = snap[snap["civilization"] == civ]
+                v = r[metric].values[0] if not r.empty else float("nan")
+                row += f"  {v:>{col_w}.3f}"
+            print(row)
+
+
+def print_decisions_table(df: pd.DataFrame, civ: str, label: str = "") -> None:
+    """Print per-turn tech/trade/expand decisions and key metrics for one nation."""
+    d   = df[df["civilization"] == civ].sort_values("year")
+    tag = f"  [{label}]" if label else ""
+    print(f"\n  {civ}{tag}")
+    print(f"  {'Year':<6} {'Tech':>6} {'Trade':>6} {'Exp':>5}  "
+          f"{'GDP':>8}  {'TradeInc':>9}  {'Terr':>6}  {'TechC':>7}")
+    print(f"  {_sep(64)}")
+    for _, r in d.iterrows():
+        tech  = TECH_SHORT.get(r["decision_tech"],   str(r["decision_tech"]))
+        trade = TRADE_SHORT.get(r["decision_trade"],  str(r["decision_trade"]))
+        exp   = EXPAND_SHORT.get(int(r["decision_expand"]), str(int(r["decision_expand"])))
+        print(f"  {int(r['year']):<6} {tech:>6} {trade:>6} {exp:>5}  "
+              f"{r['gdp']:>8.2f}  {r['trade_income']:>9.4f}  "
+              f"{r['territories']:>6.2f}  {r['tech_composite']:>7.3f}")
+
+
+def print_rl_decision_summary(engine: SimulationEngine, rl_df: pd.DataFrame) -> None:
+    """Detailed breakdown of how each RL agent made decisions."""
+    print(f"\n{'═'*68}")
+    print("RL Agent Decision Analysis")
+    print('═'*68)
+
+    for civ_name, strat in engine.strategy_map.items():
+        if not isinstance(strat, QLearningStrategy):
+            continue
+
+        d = rl_df[rl_df["civilization"] == civ_name]
+
+        print(f"\n  Agent : {civ_name}")
+        print(f"  Reward: {strat.reward_type}")
+        print(f"  Q-states explored: {len(strat.q_table)}")
+
+        # Action frequency table
+        tech_v  = d["decision_tech"].value_counts()
+        trade_v = d["decision_trade"].value_counts()
+        exp_v   = d["decision_expand"].value_counts()
+        n       = len(d)
+
+        print(f"\n  Action frequencies ({n} turns total):")
+        print(f"    Tech:   " +
+              "  ".join(f"{TECH_SHORT.get(k,k)}={v}({100*v//n}%)"
+                        for k, v in tech_v.items()))
+        print(f"    Trade:  " +
+              "  ".join(f"{TRADE_SHORT.get(k,k)}={v}({100*v//n}%)"
+                        for k, v in trade_v.items()))
+        print(f"    Expand: " +
+              "  ".join(f"{EXPAND_SHORT.get(int(k),k)}={v}({100*v//n}%)"
+                        for k, v in exp_v.items()))
+
+        # Era-level breakdown: which tech did RL prefer per era?
+        era_map = {"MEDIEVAL": "E1-Med", "DISCOVERY": "E2-Disc",
+                   "MERCANTILE": "E3-Merc", "INDUSTRIAL": "E4-Ind"}
+        print(f"\n  Tech focus by era:")
+        for era_key, era_label in era_map.items():
+            de = d[d["era"] == era_key]
+            if de.empty:
+                continue
+            top = de["decision_tech"].value_counts().idxmax()
+            pct = int(100 * de["decision_tech"].value_counts().max() / len(de))
+            print(f"    {era_label}: preferred {TECH_SHORT.get(top, top):>4}  ({pct}% of turns)")
+
+        # Per-turn decision trace
+        print_decisions_table(rl_df, civ_name, label=f"RL/{strat.reward_type}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Chart output
+# ─────────────────────────────────────────────────────────────────────────
+
+def save_comparison_chart(rule_df: pd.DataFrame, rl_df: pd.DataFrame,
+                          mode: str, rl_civs: list) -> str:
+    """
+    4-panel figure:
+      - Top:    GDP rule-based (solid) vs RL (dashed) for all nations
+      - Mid:    RL tech-focus heatmap (nation × year)
+      - Bottom: RL trade-policy heatmap | RL expansion heatmap
+    """
+    fig = plt.figure(figsize=(17, 12))
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.28)
+
+    # ── Panel 1: GDP comparison ──────────────────────────────────────────
+    ax_gdp = fig.add_subplot(gs[0, :])
+    civs   = sorted(rule_df["civilization"].unique())
+
+    for i, civ in enumerate(civs):
+        color  = PALETTE[i % len(PALETTE)]
+        d_rule = rule_df[rule_df["civilization"] == civ]
+        d_rl   = rl_df[rl_df["civilization"] == civ]
+        ax_gdp.plot(d_rule["year"], d_rule["gdp"],
+                    color=color, linewidth=2.2, label=f"{civ} rule")
+        ls = "--" if civ in rl_civs else ":"
+        ax_gdp.plot(d_rl["year"], d_rl["gdp"],
+                    color=color, linewidth=1.6, linestyle=ls, alpha=0.75,
+                    label=f"{civ} RL" if civ in rl_civs else "_")
+
+    for x1, x2, c in ERA_BANDS:
+        ax_gdp.axvspan(x1, x2, alpha=0.05, color=c)
+
+    ax_gdp.set_xlabel("Year")
+    ax_gdp.set_ylabel("GDP")
+    ax_gdp.set_title(f"GDP — rule-based (solid) vs RL agents (dashed)  [{mode}]")
+    ax_gdp.legend(fontsize=7.5, ncol=min(len(civs) * 2, 6), loc="upper left")
+    ax_gdp.grid(alpha=0.25)
+
+    if not rl_civs:
+        plt.tight_layout()
+        path = os.path.join(OUTPUT_DIR, f"comparison_{mode.replace('-','_')}.png")
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        return path
+
+    # ── Panels 2-4: RL decision heatmaps ────────────────────────────────
+    rl_sub = rl_df[rl_df["civilization"].isin(rl_civs)].copy()
+    years  = sorted(rl_sub["year"].unique())
+    nr     = len(rl_civs)
+
+    def _make_matrix(col, mapping):
+        m = np.zeros((nr, len(years)))
+        for ri, civ in enumerate(rl_civs):
+            for ci, y in enumerate(years):
+                r = rl_sub[(rl_sub["civilization"] == civ) & (rl_sub["year"] == y)]
+                if not r.empty:
+                    raw = r[col].values[0]
+                    if raw in mapping:
+                        m[ri, ci] = mapping[raw]
+                    else:
+                        try:
+                            m[ri, ci] = mapping.get(int(raw), 0)
+                        except (ValueError, TypeError):
+                            m[ri, ci] = 0
+        return m
+
+    def _label_axes(ax, title, xtick_step=2):
+        ax.set_yticks(range(nr))
+        ax.set_yticklabels(rl_civs, fontsize=8)
+        xt = list(range(0, len(years), xtick_step))
+        ax.set_xticks(xt)
+        ax.set_xticklabels([years[i] for i in xt], rotation=45, fontsize=7)
+        ax.set_title(title, fontsize=9)
+
+    # Tech focus
+    ax_tech = fig.add_subplot(gs[1, :])
+    mat_tech = _make_matrix("decision_tech", TECH_IDX)
+    im1 = ax_tech.imshow(mat_tech, aspect="auto", cmap="tab10",
+                          vmin=0, vmax=4, interpolation="nearest")
+    _label_axes(ax_tech, "Tech Focus  (0=Agri  1=Nav  2=Mil  3=Ind  4=Com)")
+    cb1 = fig.colorbar(im1, ax=ax_tech, orientation="vertical",
+                        pad=0.01, fraction=0.015)
+    cb1.set_ticks([0, 1, 2, 3, 4])
+    cb1.set_ticklabels(["Agri", "Nav", "Mil", "Ind", "Com"], fontsize=7)
+
+    # Trade policy
+    ax_trade = fig.add_subplot(gs[2, 0])
+    mat_trade = _make_matrix("decision_trade", TRADE_ORDER)
+    im2 = ax_trade.imshow(mat_trade, aspect="auto", cmap="RdYlGn_r",
+                           vmin=0, vmax=2, interpolation="nearest")
+    _label_axes(ax_trade, "Trade Policy  (0=Open  1=Balanced  2=Closed)")
+    cb2 = fig.colorbar(im2, ax=ax_trade, pad=0.02, fraction=0.08)
+    cb2.set_ticks([0, 1, 2])
+    cb2.set_ticklabels(["Open", "Bal", "Cls"], fontsize=7)
+
+    # Expansion
+    ax_exp = fig.add_subplot(gs[2, 1])
+    mat_exp = _make_matrix("decision_expand", {0: 0, 1: 1, 2: 2})
+    im3 = ax_exp.imshow(mat_exp, aspect="auto", cmap="YlOrRd",
+                         vmin=0, vmax=2, interpolation="nearest")
+    _label_axes(ax_exp, "Expansion  (0=Stay  1=Moderate  2=Aggressive)")
+    cb3 = fig.colorbar(im3, ax=ax_exp, pad=0.02, fraction=0.08)
+    cb3.set_ticks([0, 1, 2])
+    cb3.set_ticklabels(["Stay", "Mod", "Agg"], fontsize=7)
+
+    path = os.path.join(OUTPUT_DIR, f"rl_comparison_{mode.replace('-','_')}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  图表已保存：{save_path}")
+    return path
 
 
-# ─────────────────────────────────────────────
-# 入口
-# ─────────────────────────────────────────────
+def save_turn_charts(rule_df: pd.DataFrame, mode: str) -> str:
+    """Per-nation GDP + tech breakdown as small-multiples."""
+    civs = sorted(rule_df["civilization"].unique())
+    ncol = min(3, len(civs))
+    nrow = -(-len(civs) // ncol)  # ceil division
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5 * ncol, 4 * nrow), squeeze=False)
+    fig.suptitle(f"Per-turn data — {mode}", fontsize=13)
+
+    for idx, civ in enumerate(civs):
+        ax  = axes[idx // ncol][idx % ncol]
+        d   = rule_df[rule_df["civilization"] == civ]
+        col = PALETTE[idx % len(PALETTE)]
+
+        ax.plot(d["year"], d["gdp"], color=col, linewidth=2, label="GDP")
+        ax2 = ax.twinx()
+        ax2.plot(d["year"], d["tech_composite"], color=col, linewidth=1.2,
+                 linestyle="--", alpha=0.6, label="Tech")
+        ax2.set_ylabel("Tech", fontsize=8)
+
+        for x1, x2, c in ERA_BANDS:
+            ax.axvspan(x1, x2, alpha=0.06, color=c)
+
+        ax.set_title(civ, fontsize=10, fontweight="bold", color=col)
+        ax.set_xlabel("Year", fontsize=8)
+        ax.set_ylabel("GDP", fontsize=8)
+        ax.grid(alpha=0.2)
+
+    # Hide empty panels
+    for idx in range(len(civs), nrow * ncol):
+        axes[idx // ncol][idx % ncol].set_visible(False)
+
+    plt.tight_layout()
+    path = os.path.join(OUTPUT_DIR, f"turns_{mode.replace('-','_')}.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return path
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="世界经济形成模拟——实验运行器")
-    parser.add_argument("--seed",         type=int,   default=42)
-    parser.add_argument("--no-events",    action="store_true", help="关闭随机事件")
-    parser.add_argument("--train-rl",     type=int,   default=0, help="RL 训练轮数（0=跳过）")
-    parser.add_argument("--monte-carlo",  type=int,   default=0, help="蒙特卡洛次数（0=跳过）")
+    parser = argparse.ArgumentParser(description="World Economy Sim — experiment runner")
+    parser.add_argument("--mode",        default="5-Nation",
+                        help=f"Competition mode. Choices: {list(COMPETITION_MODES.keys())}")
+    parser.add_argument("--seed",        type=int, default=42)
+    parser.add_argument("--no-events",   action="store_true", help="Disable random events")
+    parser.add_argument("--rl-episodes", type=int, default=60,
+                        help="RL training episodes (0 = skip RL)")
     args = parser.parse_args()
 
     events = not args.no_events
+    mode   = args.mode
 
-    # 必须配置中文字体（不配置则中文会乱码）
-    plt.rcParams["font.family"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    if mode not in COMPETITION_MODES:
+        print(f"Unknown mode '{mode}'. Available: {list(COMPETITION_MODES.keys())}")
+        sys.exit(1)
 
-    print(f"输出目录：{OUTPUT_DIR}")
+    plt.rcParams["font.family"] = ["DejaVu Sans"]
 
-    # 实验 1
-    experiment_baseline(args.seed, events)
+    print(f"Output dir : {OUTPUT_DIR}")
+    print(f"Mode       : {mode}  ({COMPETITION_MODES[mode]['desc']})")
+    print(f"Seed       : {args.seed}   Events: {events}   RL episodes: {args.rl_episodes}")
 
-    # 实验 2
-    experiment_strategy_swap(args.seed)
+    # ── 1. Rule-based run ────────────────────────────────────────────────
+    print("\nRunning rule-based simulation...")
+    rule_df = run_rule_based(mode, args.seed, events)
 
-    # 实验 3
-    experiment_geography_swap(args.seed)
+    print_turn_table(rule_df, mode)
 
-    # 实验 4（蒙特卡洛，可选）
-    if args.monte_carlo > 0:
-        experiment_monte_carlo(args.monte_carlo)
+    print(f"\n{'═'*68}")
+    print("Rule-based — decisions per nation:")
+    for civ in sorted(rule_df["civilization"].unique()):
+        print_decisions_table(rule_df, civ, label="rule")
 
-    print("\n" + "="*60)
-    print("所有实验完成！图表已保存到 output/ 目录。")
-    print("启动可视化仪表板：  streamlit run app.py")
-    print("="*60)
+    # Save per-turn CSV and chart
+    csv_path = os.path.join(OUTPUT_DIR, f"turns_{mode.replace('-','_')}.csv")
+    rule_df.to_csv(csv_path, index=False)
+    print(f"\nCSV saved : {csv_path}")
+
+    chart_path = save_turn_charts(rule_df, mode)
+    print(f"Chart saved: {chart_path}")
+
+    # ── 2. RL run ────────────────────────────────────────────────────────
+    if args.rl_episodes > 0:
+        print(f"\nTraining RL agents ({args.rl_episodes} episodes)...")
+        rl_df, curves, rl_engine = run_rl(mode, args.seed, args.rl_episodes)
+
+        rl_civs = [n for n, s in rl_engine.strategy_map.items()
+                   if isinstance(s, QLearningStrategy)]
+
+        # Training curve summary
+        print(f"\n  Training improvement (ep-1 → ep-{args.rl_episodes}):")
+        for civ, vals in curves.items():
+            if vals:
+                delta = (vals[-1] - vals[0]) / max(abs(vals[0]), 1e-6) * 100
+                print(f"    {civ:<15}  start={vals[0]:.2f}  "
+                      f"end={vals[-1]:.2f}  Δ={delta:+.1f}%")
+
+        # Final GDP comparison
+        print(f"\n{'═'*68}")
+        print("Final GDP — rule-based vs RL:")
+        print(f"  {'Nation':<15} {'Rule':>9} {'RL':>9} {'Diff':>9}")
+        print(f"  {_sep(46)}")
+        for civ in sorted(rule_df["civilization"].unique()):
+            r_max = rule_df[rule_df["civilization"] == civ]["year"].max()
+            l_max = rl_df[rl_df["civilization"] == civ]["year"].max()
+            r_gdp = rule_df[(rule_df["civilization"]==civ)&(rule_df["year"]==r_max)]["gdp"].values[0]
+            l_gdp = rl_df[(rl_df["civilization"]==civ)&(rl_df["year"]==l_max)]["gdp"].values[0]
+            diff  = l_gdp - r_gdp
+            tag   = " ↑" if diff > 0.05 else (" ↓" if diff < -0.05 else "  ")
+            print(f"  {civ:<15} {r_gdp:>9.2f} {l_gdp:>9.2f} {diff:>+9.2f}{tag}")
+
+        # RL decision analysis
+        print_rl_decision_summary(rl_engine, rl_df)
+
+        # Save RL CSV and comparison chart
+        rl_csv = os.path.join(OUTPUT_DIR, f"rl_turns_{mode.replace('-','_')}.csv")
+        rl_df.to_csv(rl_csv, index=False)
+        print(f"\nRL CSV saved : {rl_csv}")
+
+        comp_path = save_comparison_chart(rule_df, rl_df, mode, rl_civs)
+        print(f"Comparison chart: {comp_path}")
+
+    print(f"\n{'═'*68}")
+    print("Done.  To explore interactively:  streamlit run app.py")
+    print('═'*68)
