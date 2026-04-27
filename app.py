@@ -18,6 +18,7 @@ app.py — Streamlit 可视化仪表板（Vega-Altair 版）
 
 import streamlit as st
 import altair as alt
+from vega_datasets import data as vega_data
 import pandas as pd
 import numpy as np
 import sys, os
@@ -25,6 +26,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from src.engine import SimulationEngine, build_default_civs
 from src.strategies import make_strategy
+from src.geography import build_control_df
 
 # ── 页面配置 ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -293,49 +295,122 @@ with tab1:
     )
     st.altair_chart(share_chart, use_container_width=True)
 
-    # ── 1850年经济规模气泡散点图（以经度/纬度粗略定位）──
-    st.subheader("1850年各文明经济规模（地理示意图）")
-    st.caption("气泡大小 = GDP，颜色 = 文明，X/Y 轴为文明大致地理坐标（经度/纬度）。")
+    # ── 世界领土控制地图（真实地理 + 年份滑块）────────────────────
+    st.subheader("领土控制世界地图")
+    st.caption(
+        "每个国家/地区按控制它的文明着色。"
+        "殖民扩张随 territories 标量增长，按历史优先级依次染色。"
+        "拖动滑块观察不同年份的世界格局演变。"
+    )
 
-    bubble_chart = (
-        alt.Chart(final)
-        .mark_circle(opacity=0.85, stroke="white", strokeWidth=1)
+    # 年份滑块
+    available_years = sorted(df["year"].unique().tolist())
+    map_year = st.select_slider(
+        "选择年份",
+        options=available_years,
+        value=available_years[-1],
+        format_func=lambda y: f"{y} AD",
+    )
+
+    # 1. 根据当年领土数据构建 id → civilization 映射表
+    map_year_df  = df[df["year"] == map_year]
+    control_df   = build_control_df(map_year_df)
+
+    # 2. 底图：用 vega_data.world_110m 的 TopoJSON 渲染国家轮廓
+    #    mark_geoshape 将每个 TopoJSON feature 渲染为多边形；
+    #    未被任何文明控制的国家显示为浅灰色。
+    world_topo = alt.topo_feature(vega_data.world_110m.url, "countries")
+
+    base_map = (
+        alt.Chart(world_topo)
+        .mark_geoshape(fill="#d6e8f0", stroke="#aac4d8", strokeWidth=0.3)
+        .project("naturalEarth1")
+    )
+
+    # 3. 领土着色层：transform_lookup 把 TopoJSON feature.id 与
+    #    control_df 的 id 列关联，按 civilization 字段着色。
+    #    lookup key 是 TopoJSON 里的 id 字段（ISO 3166-1 数值）。
+    territory_map = (
+        alt.Chart(world_topo)
+        .mark_geoshape(stroke="white", strokeWidth=0.25)
+        .transform_lookup(
+            lookup="id",
+            from_=alt.LookupData(
+                data=control_df,
+                key="id",
+                fields=["civilization"],
+            ),
+        )
         .encode(
-            x=alt.X("lon:Q", title="经度", scale=alt.Scale(domain=[-120, 130])),
-            y=alt.Y("lat:Q", title="纬度", scale=alt.Scale(domain=[-15, 65])),
-            size=alt.Size("gdp:Q", scale=alt.Scale(range=[200, 4000]),
-                          legend=alt.Legend(title="GDP")),
+            color=alt.condition(
+                "datum.civilization !== null",
+                alt.Color(
+                    "civilization:N",
+                    scale=alt.Scale(
+                        domain=list(COLOR_MAP.keys()),
+                        range=list(COLOR_MAP.values()),
+                    ),
+                    legend=alt.Legend(title="控制文明"),
+                ),
+                alt.value("#d6e8f0"),   # 未被控制 → 保持底图蓝灰色
+            ),
+            tooltip=[
+                alt.Tooltip("civilization:N", title="控制文明"),
+            ],
+        )
+        .project("naturalEarth1")
+    )
+
+    # 4. GDP 气泡层：叠加在地图上，显示各文明本土的经济规模
+    gdp_bubbles = (
+        alt.Chart(map_year_df)
+        .mark_circle(opacity=0.75, stroke="white", strokeWidth=1.5)
+        .encode(
+            longitude="lon:Q",
+            latitude="lat:Q",
+            size=alt.Size(
+                "gdp:Q",
+                scale=alt.Scale(range=[60, 2800]),
+                legend=alt.Legend(title="GDP"),
+            ),
             color=alt.Color(
                 "civilization:N",
                 scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
                 legend=None,
             ),
             tooltip=[
-                alt.Tooltip("civilization:N", title="文明"),
-                alt.Tooltip("gdp:Q",          title="GDP",      format=".2f"),
-                alt.Tooltip("gdp_per_capita:Q",title="人均GDP",  format=".3f"),
-                alt.Tooltip("population:Q",    title="人口(M)",  format=".1f"),
-                alt.Tooltip("tech_composite:Q",title="技术指数", format=".2f"),
+                alt.Tooltip("civilization:N",   title="文明"),
+                alt.Tooltip("gdp:Q",            title="GDP",      format=".2f"),
+                alt.Tooltip("gdp_per_capita:Q", title="人均 GDP", format=".3f"),
+                alt.Tooltip("population:Q",     title="人口(M)",  format=".1f"),
+                alt.Tooltip("territories:Q",    title="领土倍数", format=".2f"),
+                alt.Tooltip("tech_composite:Q", title="技术综合", format=".2f"),
             ],
         )
-        .properties(width="container", height=350, title="1850年经济规模地理分布（示意）")
+        .project("naturalEarth1")
     )
-    # 叠加文明名标签
-    text_layer = (
-        alt.Chart(final)
-        .mark_text(dy=-14, fontSize=11, fontWeight="bold")
+
+    # 5. 文明名标签
+    labels = (
+        alt.Chart(map_year_df)
+        .mark_text(fontSize=9, fontWeight="bold", color="#222", dy=-13)
         .encode(
-            x="lon:Q", y="lat:Q",
+            longitude="lon:Q",
+            latitude="lat:Q",
             text="civilization:N",
-            color=alt.Color(
-                "civilization:N",
-                scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
-                legend=None,
-            ),
+        )
+        .project("naturalEarth1")
+    )
+
+    world_map = (
+        alt.layer(base_map, territory_map, gdp_bubbles, labels)
+        .properties(
+            width="container",
+            height=430,
+            title=f"世界领土控制格局 — {map_year} AD",
         )
     )
-    st.altair_chart((bubble_chart + text_layer).properties(width="container", height=360),
-                    use_container_width=True)
+    st.altair_chart(world_map, use_container_width=True)
 
     # ── 事件日志 ──
     if events_on and not event_df.empty:
@@ -352,12 +427,12 @@ with tab1:
 with tab2:
     st.header("📈 经济发展轨迹详细分析")
 
-    # ── 4 指标折线图（2×2）──────────────────────────────
+    # ── 4 指标折线图（2×2 用 st.columns 实现，避免 hconcat 宽度失效）──
     st.subheader("四维度经济发展轨迹")
-    st.caption("背景色带区分历史时期；鼠标悬停可查看具体数值；可拖拽和缩放。")
+    st.caption("背景色带区分历史时期；鼠标悬停可查看具体数值；可拖拽缩放。")
 
     def make_panel(y_field, y_title, show_legend=False):
-        """通用折线面板构造器（带时代背景）"""
+        """折线图 + 时代色带，width='container' 在独立列中能正确撑满。"""
         lines = (
             alt.Chart(df_flt)
             .mark_line(strokeWidth=2)
@@ -374,28 +449,26 @@ with tab2:
         )
         return (
             alt.layer(era_bands(), lines)
-            .properties(width="container", height=240)
+            .properties(width="container", height=280)
             .interactive()
         )
 
-    # 上行：GDP 总量 + 人均 GDP
-    row1 = alt.hconcat(
-        make_panel("gdp",           "GDP（相对单位）", show_legend=True),
-        make_panel("gdp_per_capita","人均 GDP"),
-    ).resolve_scale(y="independent")  # 两图纵轴独立缩放
+    # 每个 st.columns 列各占 50%，altair width="container" 才能正确填满列宽
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(make_panel("gdp", "GDP（相对单位）", show_legend=True),
+                        use_container_width=True)
+    with c2:
+        st.altair_chart(make_panel("gdp_per_capita", "人均 GDP"),
+                        use_container_width=True)
 
-    # 下行：人口 + 军事实力
-    row2 = alt.hconcat(
-        make_panel("population",  "人口（百万）"),
-        make_panel("military_str","军事实力"),
-    ).resolve_scale(y="independent")
-
-    st.altair_chart(
-        alt.vconcat(row1, row2)
-        .properties(title="经济四维度发展轨迹（1000-1850）")
-        .configure_title(fontSize=15),
-        use_container_width=True,
-    )
+    c3, c4 = st.columns(2)
+    with c3:
+        st.altair_chart(make_panel("population", "人口（百万）"),
+                        use_container_width=True)
+    with c4:
+        st.altair_chart(make_panel("military_str", "军事实力"),
+                        use_container_width=True)
 
     # ── 大分流放大图 ─────────────────────────────────────
     st.subheader('🔍 "大分流"放大：1700-1850 年人均 GDP')
@@ -466,36 +539,53 @@ with tab3:
     )
     st.altair_chart(tech_chart, use_container_width=True)
 
-    # ── 所有技术的横向折线面板 ────────────────────────────
+    # ── 五大技术领域全景对比（2+2+1 布局，每图独立列撑满宽度）──
     st.subheader("五大技术领域全景对比")
     st.caption("可以看出各文明的『技术专精』路径：葡西的航海、英国的工业、荷兰的商业……")
 
-    tech_panels = []
-    for field, label in TECH_FIELDS.items():
-        p = (
+    def tech_line(field, label):
+        lines = (
             alt.Chart(df_flt)
             .mark_line(strokeWidth=1.8)
             .encode(
-                x=alt.X("year:Q", title=""),
-                y=alt.Y(f"{field}:Q", title="水平(0-10)", scale=alt.Scale(domain=[0, 10])),
+                x=alt.X("year:Q", title="年份"),
+                y=alt.Y(f"{field}:Q", title="水平(0-10)",
+                        scale=alt.Scale(domain=[0, 10])),
                 color=alt.Color(
                     "civilization:N",
-                    scale=alt.Scale(domain=list(COLOR_MAP.keys()), range=list(COLOR_MAP.values())),
+                    scale=alt.Scale(domain=list(COLOR_MAP.keys()),
+                                    range=list(COLOR_MAP.values())),
                     legend=None,
                 ),
                 tooltip=["civilization:N", "year:Q", f"{field}:Q"],
             )
         )
-        tech_panels.append(
-            alt.layer(era_bands(), p)
-            .properties(width="container", height=140, title=label)
+        return (
+            alt.layer(era_bands(), lines)
+            .properties(width="container", height=220, title=label)
             .interactive()
         )
 
-    st.altair_chart(
-        alt.vconcat(*tech_panels).resolve_scale(y="shared"),
-        use_container_width=True,
-    )
+    row_a1, row_a2 = st.columns(2)
+    fields_list = list(TECH_FIELDS.items())
+    with row_a1:
+        st.altair_chart(tech_line(fields_list[0][0], fields_list[0][1]),
+                        use_container_width=True)
+    with row_a2:
+        st.altair_chart(tech_line(fields_list[1][0], fields_list[1][1]),
+                        use_container_width=True)
+
+    row_b1, row_b2 = st.columns(2)
+    with row_b1:
+        st.altair_chart(tech_line(fields_list[2][0], fields_list[2][1]),
+                        use_container_width=True)
+    with row_b2:
+        st.altair_chart(tech_line(fields_list[3][0], fields_list[3][1]),
+                        use_container_width=True)
+
+    # 工业技术单独全宽（最重要，值得更大展示）
+    st.altair_chart(tech_line(fields_list[4][0], fields_list[4][1]),
+                    use_container_width=True)
 
     # ── 技术结构雷达图（极坐标面积图）────────────────────
     st.subheader("技术结构雷达图对比")
@@ -530,10 +620,11 @@ with tab3:
         col_r1, col_r2 = st.columns(2)
         for col_w, yr in [(col_r1, df["year"].min()), (col_r2, df["year"].max())]:
             rdf = make_radar_df(yr)
-            # Altair 极坐标图：theta = 技术领域，radius = 技术值
+            # Altair 极坐标：theta = 技术领域，radius = 技术值（0-10）
+            # width/height 给固定值而非 "container"，极坐标布局不支持弹性宽度
             radar = (
                 alt.Chart(rdf)
-                .mark_line(point=True, strokeWidth=2, filled=False)
+                .mark_line(point=True, strokeWidth=2.2, filled=False)
                 .encode(
                     theta=alt.Theta("domain:N", sort=list(domains_cn.values())),
                     radius=alt.Radius("value:Q", scale=alt.Scale(domain=[0, 10])),
@@ -543,16 +634,14 @@ with tab3:
                                         range=list(COLOR_MAP.values())),
                         legend=alt.Legend(title="文明"),
                     ),
-                    tooltip=["civilization:N","domain:N","value:Q"],
+                    tooltip=["civilization:N", "domain:N", "value:Q"],
                 )
-                .properties(width=280, height=280, title=f"{yr} 年技术雷达图")
             )
-            # 半透明填充层
-            radar_fill = radar.mark_arc(opacity=0.10, innerRadius=0)
+            radar_fill = radar.mark_arc(opacity=0.12, innerRadius=0)
             with col_w:
                 st.altair_chart(
-                    alt.layer(radar_fill, radar).properties(width=280, height=280,
-                              title=f"{yr} 年技术雷达图"),
+                    alt.layer(radar_fill, radar)
+                    .properties(width=340, height=340, title=f"{yr} 年技术结构雷达图"),
                     use_container_width=True,
                 )
 
@@ -596,20 +685,20 @@ with tab4:
     with col_t1:
         st.altair_chart(
             line_with_bands(df_flt, "trade_income", "贸易收益", color_map=COLOR_MAP,
-                            height=300, title="贸易收益演变"),
+                            height=360, title="贸易收益演变"),
             use_container_width=True,
         )
     with col_t2:
         st.altair_chart(
             line_with_bands(df_flt, "colonial_income", "殖民地收益", color_map=COLOR_MAP,
-                            height=300, title="殖民地收益演变"),
+                            height=360, title="殖民地收益演变"),
             use_container_width=True,
         )
 
     # 贸易开放度
     st.altair_chart(
         line_with_bands(df_flt, "trade_openness", "贸易开放度（0-1）",
-                        color_map=COLOR_MAP, height=300,
+                        color_map=COLOR_MAP, height=360,
                         title="贸易开放度演变（0=闭关锁国，1=完全自由贸易）"),
         use_container_width=True,
     )
@@ -629,7 +718,7 @@ with tab4:
             ),
             tooltip=["civilization:N","year:Q","territories:Q"],
         )
-        .properties(width="container", height=300, title="各文明控制领土扩张")
+        .properties(width="container", height=360, title="各文明控制领土扩张")
         .interactive()
     )
     st.altair_chart(alt.layer(era_bands(), terr_chart), use_container_width=True)
@@ -651,7 +740,7 @@ with tab4:
                           legend=alt.Legend(title="人口")),
             tooltip=["civilization:N","gdp:Q","trade_income:Q","population:Q","strategy:N"],
         )
-        .properties(width="container", height=320,
+        .properties(width="container", height=400,
                     title="贸易收益与 GDP 总量的关系（1850年）")
     )
     st.altair_chart(scatter_trade, use_container_width=True)
