@@ -1,0 +1,36 @@
+\contentsline {section}{\numberline {1}研究问题与建模动机}{3}{section.1}%
+\contentsline {section}{\numberline {2}模型整体架构}{3}{section.2}%
+\contentsline {section}{\numberline {3}智能体状态空间}{4}{section.3}%
+\contentsline {subsection}{\numberline {3.1}地理禀赋}{4}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}资源禀赋与时代价值}{4}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}技术水平}{4}{subsection.3.3}%
+\contentsline {section}{\numberline {4}经济动态模型}{5}{section.4}%
+\contentsline {subsection}{\numberline {4.1}全要素生产率}{5}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}生产函数}{5}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}资本积累}{5}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}人口动态}{6}{subsection.4.4}%
+\contentsline {section}{\numberline {5}贸易与殖民收益}{6}{section.5}%
+\contentsline {subsection}{\numberline {5.1}双边贸易收益}{6}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}殖民收益}{6}{subsection.5.2}%
+\contentsline {section}{\numberline {6}技术进步：投资与扩散}{7}{section.6}%
+\contentsline {paragraph}{内生投资（Active R\&D）}{7}{section*.4}%
+\contentsline {paragraph}{技术扩散（Knowledge Spillover）}{7}{section*.5}%
+\contentsline {section}{\numberline {7}策略代理系统}{7}{section.7}%
+\contentsline {subsection}{\numberline {7.1}动作空间}{7}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}规则式策略（历史原型基准）}{7}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Q-Learning 策略（机器学习代理）}{8}{subsection.7.3}%
+\contentsline {paragraph}{状态表示}{8}{section*.7}%
+\contentsline {paragraph}{Double Q-Learning 更新}{8}{section*.8}%
+\contentsline {paragraph}{奖励函数}{8}{section*.9}%
+\contentsline {paragraph}{训练方案}{9}{section*.10}%
+\contentsline {section}{\numberline {8}随机扰动与历史偶然性}{9}{section.8}%
+\contentsline {section}{\numberline {9}实验设计：反事实分析框架}{9}{section.9}%
+\contentsline {section}{\numberline {10}模拟实验与研究发现}{10}{section.10}%
+\contentsline {subsection}{\numberline {10.1}实验一：煤炭资源对工业化路径的影响}{10}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}实验二：东亚农业文明圈的粮食禀赋分化}{11}{subsection.10.2}%
+\contentsline {subsection}{\numberline {10.3}实验三：综合国力竞争激励对策略选择的影响}{12}{subsection.10.3}%
+\contentsline {subsection}{\numberline {10.4}实验四：策略替换反事实——农业禀赋能否支撑工业化策略？}{13}{subsection.10.4}%
+\contentsline {subsection}{\numberline {10.5}实验五：五强全规则策略的长期自然均衡}{14}{subsection.10.5}%
+\contentsline {subsection}{\numberline {10.6}实验六：三国 RL 博弈中的策略涌现与均衡陷阱}{15}{subsection.10.6}%
+\contentsline {paragraph}{跨实验综合解读}{17}{section*.21}%
+\contentsline {section}{\numberline {11}局限性与后续方向}{17}{section.11}%

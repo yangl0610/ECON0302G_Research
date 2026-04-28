@@ -296,7 +296,7 @@ class Civilization:
             t.military    / 10.0,
             t.industry    / 10.0,
             t.commerce    / 10.0,
-            self.gdp / (world_avg_gdp + 1e-6),  # 相对GDP排名代理
+            min(self.gdp / (world_avg_gdp + 1e-6) / 3.0, 1.0),  # 相对GDP（3x均值上限，防止离群值压缩差异）
             self.trade_openness,
             min(self.territories / 5.0, 1.0),
             self.geography.coast_access,

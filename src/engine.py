@@ -22,7 +22,7 @@ import pandas as pd
 from typing import List, Dict, Optional, Tuple
 from .civilization import Civilization, Era, TURNS_PER_ERA, ERA_YEARS
 from .economy import apply_turn
-from .strategies import BaseStrategy, QLearningStrategy
+from .strategies import BaseStrategy, QLearningStrategy, N_ACTIONS
 from .events import EventSystem
 from .archetypes import build_competition_civs
 
@@ -141,7 +141,7 @@ class SimulationEngine:
                 strategy = self.strategy_map[civ.name]
                 if isinstance(strategy, QLearningStrategy):
                     state_vec = civ.state_vector(world_avg_gdp, era)
-                    strategy.update(civ, state_vec, era)
+                    strategy.update(civ, state_vec, era, all_civs=self.civs)
 
         # 4. 记录所有文明的当前状态（含本回合决策）
         for civ in self.civs:
@@ -169,18 +169,27 @@ class SimulationEngine:
 
     # ─── 训练 RL 智能体 ────────────────────────────────
 
-    def train_rl_agents(self, n_episodes: int = 80) -> Dict[str, List[float]]:
+    def train_rl_agents(self, n_episodes: int = 150,
+                        eps_start: float = 0.50,
+                        eps_end:   float = 0.03) -> Dict[str, List[float]]:
         """
         对所有 QLearningStrategy 智能体进行多轮训练。
 
         每个 episode = 一次完整的历史模拟（1000-1850 年）。
-        每个 episode 结束后重置文明状态，衰减探索率。
+        每个 episode 用不同随机种子，增加环境多样性。
 
-        返回：各 RL 智能体的每轮总 GDP 训练曲线（用于展示学习过程）
+        ε 线性衰减：从 eps_start 均匀降到 eps_end，
+        比指数衰减更可控——前期充分探索，后期充分利用。
+
+        参数：
+          n_episodes : 训练轮数
+          eps_start  : 初始探索率（默认 0.30）
+          eps_end    : 末期探索率（默认 0.05）
+        返回：
+          {国家名: [每轮终局GDP]}  训练曲线，格式与原版相同
         """
         from copy import deepcopy
 
-        # 找出所有 QL 策略
         rl_agents = {
             name: strat
             for name, strat in self.strategy_map.items()
@@ -189,53 +198,60 @@ class SimulationEngine:
         if not rl_agents:
             return {}
 
-        # 保存初始文明状态，每个 episode 后重置
-        initial_civs = deepcopy(self.civs)
+        initial_civs    = deepcopy(self.civs)
         training_curves: Dict[str, List[float]] = {name: [] for name in rl_agents}
 
-        print(f"开始训练 {len(rl_agents)} 个 RL 智能体，共 {n_episodes} 轮...")
+        names_str   = ", ".join(
+            f"{n}({s.reward_type}{'+comp' if s.competitive else ''})"
+            for n, s in rl_agents.items()
+        )
+        print_every = max(1, n_episodes // 5)
+        print(f"训练 {len(rl_agents)} 个 RL 智能体 [{names_str}]，共 {n_episodes} 轮...")
+        print(f"  ε: {eps_start:.2f} → {eps_end:.2f}  |  动作空间: {N_ACTIONS}  |  状态维度: 8")
 
         for episode in range(n_episodes):
-            # 重置文明状态
-            self.civs = deepcopy(initial_civs)
+            # 线性 ε 衰减：第 0 轮 = eps_start，最后一轮 = eps_end
+            frac    = episode / max(n_episodes - 1, 1)
+            cur_eps = eps_start + frac * (eps_end - eps_start)
+            for strat in rl_agents.values():
+                strat.set_epsilon(cur_eps)
+
+            # 重置文明与随机种子
+            self.civs         = deepcopy(initial_civs)
             self.current_year = 1000
             self.event_system.log.clear()
             self.turn_log.clear()
-            self.rng = np.random.default_rng(self.seed + episode)  # 不同 episode 用不同随机种子
+            self.rng              = np.random.default_rng(self.seed + episode)
             self.event_system.rng = self.rng
 
-            # 重置 RL 策略的 prev_state（开始新 episode）
             for strat in rl_agents.values():
                 strat._prev_state  = None
                 strat._prev_action = None
 
-            # 跑完一次模拟
             self.run()
 
-            # 记录训练曲线（各 RL 文明的最终 GDP）
-            for civ_name, strat in rl_agents.items():
+            for civ_name in rl_agents:
                 matching = [c for c in self.civs if c.name == civ_name]
                 if matching:
                     training_curves[civ_name].append(matching[0].gdp)
 
-            # 衰减探索率（随训练进行，逐渐减少随机探索）
-            for strat in rl_agents.values():
-                strat.decay_epsilon()
-
-            if (episode + 1) % 20 == 0:
-                avg_gdps = {n: training_curves[n][-1] for n in rl_agents}
-                print(f"  Episode {episode+1}/{n_episodes}: {avg_gdps}")
+            if (episode + 1) % print_every == 0:
+                gdp_str = "  ".join(
+                    f"{n}={training_curves[n][-1]:.2f}" for n in rl_agents
+                )
+                q_str = "  ".join(
+                    f"{n}:Qa={len(s.q_a)}/Qb={len(s.q_b)}" for n, s in rl_agents.items()
+                )
+                print(f"  ep {episode+1:>4}/{n_episodes}  ε={cur_eps:.3f}"
+                      f"  GDP: {gdp_str}  |  {q_str}")
 
         print("训练完成！")
-
-        # 训练完成后标记
         for strat in rl_agents.values():
             strat.is_trained = True
-            strat.epsilon    = 0.03  # 推理时保留少量探索
+            strat.set_epsilon(eps_end)
 
-        # 恢复初始状态，准备正式模拟
-        self.civs = deepcopy(initial_civs)
-        self.current_year = 1000
+        self.civs          = deepcopy(initial_civs)
+        self.current_year  = 1000
         self.training_mode = False
 
         return training_curves

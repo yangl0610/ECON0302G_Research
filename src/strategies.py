@@ -36,18 +36,36 @@ from .civilization import Civilization, Era
 # ─────────────────────────────────────────────
 # 决策空间定义
 # ─────────────────────────────────────────────
-TECH_DOMAINS = ["agriculture", "navigation", "military", "industry", "commerce"]
+TECH_DOMAINS   = ["agriculture", "navigation", "military", "industry", "commerce"]
+_TECH_CHOICES  = ["agriculture", "navigation", "military", "industry", "commerce"]  # 5
+_TRADE_CHOICES = ["open", "balanced", "closed"]  # 3
+_EXP_CHOICES   = [0, 1, 2]                       # 3
+# 完整组合：5 × 3 × 3 = 45 个离散动作（不再压缩为预设模式）
+N_ACTIONS      = len(_TECH_CHOICES) * len(_TRADE_CHOICES) * len(_EXP_CHOICES)
 
-# 离散动作：5个技术重心 × 3个扩张等级 × 3个贸易政策 = 45种组合
-# 为简化 Q-table，将其压缩为 5 种"战略模式"
-STRATEGY_MODES = {
-    0: {"tech_focus": "navigation",  "expansion_level": 2, "trade_policy": "open",     "savings_rate": 0.18, "tech_investment": 0.10, "label": "航海扩张"},
-    1: {"tech_focus": "commerce",    "expansion_level": 0, "trade_policy": "open",     "savings_rate": 0.25, "tech_investment": 0.10, "label": "商业贸易"},
-    2: {"tech_focus": "industry",    "expansion_level": 1, "trade_policy": "balanced", "savings_rate": 0.28, "tech_investment": 0.12, "label": "工业发展"},
-    3: {"tech_focus": "agriculture", "expansion_level": 0, "trade_policy": "closed",   "savings_rate": 0.20, "tech_investment": 0.08, "label": "农业保守"},
-    4: {"tech_focus": "military",    "expansion_level": 2, "trade_policy": "closed",   "savings_rate": 0.15, "tech_investment": 0.07, "label": "军事扩张"},
+# 储蓄率和技术投资率跟随 tech_focus（各技术领域的投入偏好）
+_TECH_ECON = {
+    "agriculture": {"savings_rate": 0.20, "tech_investment": 0.08},
+    "navigation":  {"savings_rate": 0.18, "tech_investment": 0.10},
+    "military":    {"savings_rate": 0.15, "tech_investment": 0.07},
+    "industry":    {"savings_rate": 0.28, "tech_investment": 0.12},
+    "commerce":    {"savings_rate": 0.25, "tech_investment": 0.10},
 }
-N_ACTIONS = len(STRATEGY_MODES)
+
+
+def _action_to_decision(action_idx: int) -> Dict:
+    """将整数动作索引（0-44）解码为完整的决策字典。"""
+    nt, ne = len(_TRADE_CHOICES), len(_EXP_CHOICES)
+    ti = action_idx // (nt * ne)
+    ri = (action_idx % (nt * ne)) // ne
+    ei = action_idx % ne
+    tech = _TECH_CHOICES[ti]
+    return {
+        "tech_focus":      tech,
+        "trade_policy":    _TRADE_CHOICES[ri],
+        "expansion_level": _EXP_CHOICES[ei],
+        **_TECH_ECON[tech],
+    }
 
 
 # ─────────────────────────────────────────────
@@ -245,213 +263,238 @@ class TradeHub(BaseStrategy):
 # ─────────────────────────────────────────────
 class QLearningStrategy(BaseStrategy):
     """
-    使用表格型 Q-learning 训练的策略。
+    Double Q-Learning 策略。
 
-    状态空间设计：
-      将 12 维连续状态向量离散化为 4^6 = 4096 种状态
-      （取 6 个最重要的特征，每个分 4 个等级）
-      这是 Q-table 大小和训练速度之间的权衡。
-
-    动作空间：
-      5 种战略模式（见 STRATEGY_MODES）
-
-    训练方式：
-      在 SimulationEngine 中进行 N 个 episode 的 self-play 训练，
-      每个文明独立学习，不知道其他文明的内部状态（部分可观测）。
-
-    奖励函数：
-      可配置为 "gdp"（最大化 GDP 增长）、
-                "power"（最大化综合国力）、
-                "trade"（最大化贸易收益）
+    改进要点（相对原始版本）：
+      1. 动作空间 5 → 45（tech×trade×expand 三维独立选择）
+         RL 可以自由发现任意组合，不受预设模式限制
+      2. 状态维度 6 → 8（新增 military_tech、trade_openness）
+         理论状态数 4^8 = 65536，稀疏字典存储
+      3. Double Q-Learning：双表（q_a/q_b）交替更新
+         q_a 选动作，q_b 评估目标值，减少 Q 值高估偏差
+      4. 奖励裁剪到 [-5, 5]，防止异常值破坏 Q 表
+      5. 竞争激励（可选）：在基础奖励上叠加
+         本国 GDP 相对对手均值的优势项，
+         鼓励智能体对竞争态势做出响应
     """
 
     def __init__(
         self,
-        reward_type: str = "gdp",   # "gdp" | "power" | "trade"
-        learning_rate: float = 0.15,
-        discount:      float = 0.90,
-        epsilon:       float = 0.20,  # ε-greedy 探索率
-        label: str = None,
+        reward_type:        str   = "gdp",   # "gdp" | "power" | "trade"
+        learning_rate:      float = 0.15,
+        discount:           float = 0.90,
+        epsilon:            float = 0.30,    # 初始探索率（由 engine 统一线性衰减）
+        competitive:        bool  = False,   # 竞争激励开关
+        competitive_weight: float = 0.25,   # 竞争奖励项的权重
+        label:              str   = None,
     ):
-        self.reward_type   = reward_type
-        self.lr            = learning_rate
-        self.gamma         = discount
-        self.epsilon       = epsilon
-        self.label_name    = label or f"RL_{reward_type}"
+        self.reward_type        = reward_type
+        self.lr                 = learning_rate
+        self.gamma              = discount
+        self.epsilon            = epsilon
+        self.competitive        = competitive
+        self.competitive_weight = competitive_weight
+        self.label_name         = label or f"RL_{reward_type}"
 
-        # Q-table: 字典形式，只存访问过的状态（稀疏）
-        # key: 离散状态元组, value: ndarray(N_ACTIONS,)
-        self.q_table: Dict[tuple, np.ndarray] = {}
+        # 双 Q 表：稀疏字典，key=离散状态元组, value=ndarray(N_ACTIONS,)
+        self.q_a: Dict[tuple, np.ndarray] = {}
+        self.q_b: Dict[tuple, np.ndarray] = {}
 
-        self.is_trained = False
-        self._prev_state: Optional[tuple] = None
-        self._prev_action: Optional[int]  = None
+        self.is_trained        = False
+        self._prev_state:  Optional[tuple] = None
+        self._prev_action: Optional[int]   = None
         self._prev_gdp:    float = 0.0
         self._prev_trade:  float = 0.0
         self._prev_power:  float = 0.0
+        self._prev_tech:   float = 0.0
 
     def name(self) -> str:
         return self.label_name
 
-    # ─── 状态离散化 ──────────────────────────────
+    @property
+    def q_table(self) -> Dict:
+        """向后兼容：返回 q_a（用于 len() 统计已探索状态数）"""
+        return self.q_a
+
+    # ─── 状态离散化（8 维）──────────────────────
 
     def _discretize(self, state_vec: np.ndarray) -> tuple:
         """
-        将连续状态向量压缩为离散索引元组。
-        取最关键的 6 个维度，每个分成 4 个等级（0-3）。
+        将连续状态向量离散化为 8 个 4-level 特征的元组。
+        理论最大状态数 4^8 = 65536，实际稀疏存储远少于此。
 
-        选取的 6 个特征（对应 civilization.state_vector 的索引）：
+        选取特征（对应 civilization.state_vector 索引）：
           0  agriculture_tech
           1  navigation_tech
+          2  military_tech      ← 相比原版新增
           3  industry_tech
           4  commerce_tech
           5  relative_gdp
+          6  trade_openness     ← 相比原版新增
           11 era_index
         """
-        key_indices = [0, 1, 3, 4, 5, 11]
-        thresholds  = [0.25, 0.50, 0.75]  # 4 级别：[0,0.25), [0.25,0.5), [0.5,0.75), [0.75,1]
+        key_indices = [0, 1, 2, 3, 4, 5, 6, 11]
+        thresholds  = [0.25, 0.50, 0.75]
         disc = []
         for i in key_indices:
             v = float(np.clip(state_vec[i], 0.0, 1.0))
-            level = sum(v >= th for th in thresholds)
-            disc.append(level)
+            disc.append(sum(v >= th for th in thresholds))
         return tuple(disc)
 
-    def _get_q(self, state: tuple) -> np.ndarray:
-        """获取 Q 值（不存在则初始化为小随机值，鼓励探索）"""
-        if state not in self.q_table:
-            self.q_table[state] = np.random.uniform(0.0, 0.1, N_ACTIONS)
-        return self.q_table[state]
+    def _get_q(self, state: tuple, table: Dict) -> np.ndarray:
+        """从指定表中取 Q 值（不存在则用小随机值初始化，鼓励早期探索）"""
+        if state not in table:
+            table[state] = np.random.uniform(0.0, 0.05, N_ACTIONS)
+        return table[state]
 
-    # ─── 动作选择（ε-greedy）─────────────────────
+    # ─── 动作选择（ε-greedy，双表均值）─────────
 
     def _choose_action(self, state: tuple, training: bool) -> int:
-        """
-        训练时用 ε-greedy：以概率 ε 随机探索，以 1-ε 选最优动作。
-        推理时直接选 Q 值最高的动作（贪婪策略）。
-        """
+        """训练时 ε-greedy 探索；推理时用双表均值选最优动作。"""
         if training and np.random.random() < self.epsilon:
             return np.random.randint(N_ACTIONS)
-        return int(np.argmax(self._get_q(state)))
+        q_avg = (self._get_q(state, self.q_a) + self._get_q(state, self.q_b)) / 2.0
+        return int(np.argmax(q_avg))
 
     # ─── 奖励计算 ─────────────────────────────────
 
-    def _compute_reward(self, civ: Civilization) -> float:
+    def _compute_reward(self, civ: Civilization, era: Era, all_civs=None) -> float:
         """
-        根据 reward_type 计算本回合奖励。
+        base reward（按 reward_type）+ 技术进度辅助奖励 + 可选竞争激励，最终裁剪到 [-5, 5]。
 
-        奖励设计的核心问题：
-          - 纯 GDP 奖励 → 智能体学会工业优先（类似英国）
-          - 领土/军事奖励 → 智能体学会航海扩张（类似西班牙）
-          - 贸易收益奖励 → 智能体学会开放贸易（类似荷兰）
-        通过对比这三种涌现策略与规则式策略的相似度，
-        可以验证"历史上的国家行为是否是对某种目标函数的优化"
+        技术进度辅助奖励（所有类型通用）：
+          tech_bonus = 0.3 × Δtech_composite
+          提供更及时的中间信号，帮助 RL 发现"先投技术后获益"的长期策略。
+
+        竞争激励项：weight × (own_power - opp_avg_power) / opp_avg_power
         """
+        tech_now   = civ.technology.composite(era)
+        tech_bonus = 0.3 * (tech_now - self._prev_tech)
+
         if self.reward_type == "gdp":
-            # GDP 增长率（对数差分，防止绝对值主导）
-            reward = np.log(civ.gdp + 1) - np.log(self._prev_gdp + 1)
+            base = np.log(civ.gdp + 1) - np.log(self._prev_gdp + 1) + tech_bonus
         elif self.reward_type == "power":
-            # 综合国力 = GDP × 军事 × 领土
             power = civ.gdp * civ.military_str * civ.territories
-            reward = np.log(power + 1) - np.log(self._prev_power + 1)
+            base  = np.log(power + 1) - np.log(self._prev_power + 1) + tech_bonus
         elif self.reward_type == "trade":
-            # 贸易收益绝对值 + 增量奖励
-            reward = civ.trade_income - self._prev_trade + 0.1 * civ.trade_income
+            base = (civ.trade_income - self._prev_trade) + tech_bonus
         else:
-            reward = civ.gdp - self._prev_gdp
+            base = civ.gdp - self._prev_gdp + tech_bonus
 
-        return float(reward)
+        comp = 0.0
+        if self.competitive and all_civs and len(all_civs) > 1:
+            opp_power = np.mean([c.gdp * c.military_str * c.territories for c in all_civs if c.name != civ.name])
+            comp      = self.competitive_weight * (civ.gdp * civ.military_str * civ.territories - opp_power) / (opp_power + 1e-6)
 
-    # ─── Q-learning 更新 ──────────────────────────
+        return float(np.clip(base + comp, -5.0, 5.0))
 
-    def update(self, civ: Civilization, state_vec: np.ndarray, era: Era) -> None:
+    # ─── Double Q-Learning 更新 ──────────────────
+
+    def update(self, civ: Civilization, state_vec: np.ndarray, era: Era,
+               all_civs=None) -> float:
         """
-        在每回合结束后调用，执行 Q 值更新（Bellman 方程）：
-          Q(s,a) ← Q(s,a) + α * [r + γ * max Q(s',a') - Q(s,a)]
+        每回合结束后调用，执行 Double Q-Learning 更新。
+
+        Double Q-Learning（Hasselt 2010）：
+          随机选定"主表"qa 和"副表"qb
+          - 用 qa 选择 argmax 动作
+          - 用 qb 计算该动作的目标值
+          - 只更新 qa
+        避免单表同时用于选择和评估导致的高估问题。
+
+        返回 TD-error 供训练监控使用。
         """
         if self._prev_state is None:
-            return
+            # 第一步只记录初始值，不更新
+            self._prev_gdp   = civ.gdp
+            self._prev_trade = civ.trade_income
+            self._prev_power = civ.gdp * civ.military_str * civ.territories
+            self._prev_tech  = civ.technology.composite(era)
+            return 0.0
 
-        reward = self._compute_reward(civ)
+        reward    = self._compute_reward(civ, era, all_civs)
         new_state = self._discretize(state_vec)
 
-        prev_q = self._get_q(self._prev_state)
-        next_q = self._get_q(new_state)
+        # 随机决定哪张表做更新（交替以保证对称）
+        if np.random.random() < 0.5:
+            qa, qb = self.q_a, self.q_b
+        else:
+            qa, qb = self.q_b, self.q_a
 
-        # Bellman 更新
-        td_target = reward + self.gamma * np.max(next_q)
-        td_error  = td_target - prev_q[self._prev_action]
-        prev_q[self._prev_action] += self.lr * td_error
+        q_curr    = self._get_q(self._prev_state, qa)
+        best_next = int(np.argmax(self._get_q(new_state, qa)))   # qa 选动作
+        td_target = reward + self.gamma * self._get_q(new_state, qb)[best_next]  # qb 评估
+        td_error  = td_target - q_curr[self._prev_action]
+        q_curr[self._prev_action] += self.lr * td_error
 
-        # 保存当前状态值供下一回合计算奖励差
         self._prev_gdp   = civ.gdp
         self._prev_trade = civ.trade_income
         self._prev_power = civ.gdp * civ.military_str * civ.territories
+        self._prev_tech  = civ.technology.composite(era)
+
+        return float(td_error)
 
     # ─── 主决策接口 ──────────────────────────────
 
-    def decide(
-        self,
-        civ: Civilization,
-        all_civs,
-        era: Era,
-        year: int,
-        training: bool = False,
-    ) -> Dict:
-        """
-        返回决策字典。
-        training=True 时会做 Q 值更新（训练阶段）；
-        training=False 时只做推理（评估/展示阶段）。
-        """
+    def decide(self, civ: Civilization, all_civs, era: Era, year: int,
+               training: bool = False) -> Dict:
         world_avg_gdp = np.mean([c.gdp for c in all_civs])
         state_vec     = civ.state_vector(world_avg_gdp, era)
         state         = self._discretize(state_vec)
+        action        = self._choose_action(state, training)
 
-        action = self._choose_action(state, training)
-
-        # 记录，供下回合 update() 使用
         self._prev_state  = state
         self._prev_action = action
         self._prev_gdp    = civ.gdp
         self._prev_trade  = civ.trade_income
         self._prev_power  = civ.gdp * civ.military_str * civ.territories
+        self._prev_tech   = civ.technology.composite(era)
 
-        return dict(STRATEGY_MODES[action])  # 返回副本，防止被修改
+        return _action_to_decision(action)
 
-    # ─── 训练后降低探索率（模拟策略成熟）──────────
+    def set_epsilon(self, eps: float) -> None:
+        """由 engine 统一调用，设置当前探索率。"""
+        self.epsilon = float(np.clip(eps, 0.0, 1.0))
 
-    def decay_epsilon(self, factor: float = 0.95) -> None:
-        """随训练轮次增加，逐步降低随机探索比例"""
-        self.epsilon = max(self.epsilon * factor, 0.02)
-
-    # ─── 保存/加载 Q-table ────────────────────────
+    # ─── 保存/加载 ────────────────────────────────
 
     def save(self, path: str) -> None:
         with open(path, "wb") as f:
-            pickle.dump({"q_table": self.q_table, "reward_type": self.reward_type}, f)
+            pickle.dump({
+                "q_a": self.q_a, "q_b": self.q_b,
+                "reward_type": self.reward_type,
+                "competitive": self.competitive,
+            }, f)
 
     def load(self, path: str) -> None:
         with open(path, "rb") as f:
             data = pickle.load(f)
-        self.q_table     = data["q_table"]
+        self.q_a         = data.get("q_a", data.get("q_table", {}))
+        self.q_b         = data.get("q_b", {})
         self.reward_type = data["reward_type"]
+        self.competitive = data.get("competitive", False)
         self.is_trained  = True
-        self.epsilon     = 0.02  # 加载后用接近贪婪的策略
+        self.epsilon     = 0.02
 
-    # ─── 策略分析：返回每种模式的偏好频率 ──────────
+    # ─── 策略分析 ─────────────────────────────────
 
     def action_distribution(self) -> Dict[str, float]:
         """
-        统计在所有已访问状态上，哪种动作模式的 Q 值最高。
-        用于可视化"该 RL 策略最偏爱哪种历史决策模式"。
+        统计在所有已访问状态上，双表均值 Q 最高的动作按 tech_focus 的分布。
         """
-        counts = np.zeros(N_ACTIONS)
-        for q_vals in self.q_table.values():
-            counts[np.argmax(q_vals)] += 1
-        total = counts.sum()
+        counts    = np.zeros(N_ACTIONS)
+        nt, ne    = len(_TRADE_CHOICES), len(_EXP_CHOICES)
+        all_states = set(self.q_a) | set(self.q_b)
+        for s in all_states:
+            q_avg = (self._get_q(s, self.q_a) + self._get_q(s, self.q_b)) / 2.0
+            counts[int(np.argmax(q_avg))] += 1
+        total  = counts.sum()
         if total == 0:
-            return {STRATEGY_MODES[i]["label"]: 0.0 for i in range(N_ACTIONS)}
-        return {STRATEGY_MODES[i]["label"]: counts[i] / total for i in range(N_ACTIONS)}
+            return {t: 0.0 for t in _TECH_CHOICES}
+        result = {}
+        for ti, tech in enumerate(_TECH_CHOICES):
+            result[tech] = float(counts[ti * nt * ne : (ti + 1) * nt * ne].sum() / total)
+        return result
 
 
 # ─────────────────────────────────────────────
